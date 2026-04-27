@@ -1,0 +1,79 @@
+.ru-yt-translate-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 36px;
+  padding: 0 12px;
+  margin: 0 8px 0 0;
+  background: linear-gradient(135deg, #ff5722 0%, #d32f2f 100%);
+  color: #fff;
+  border: none;
+  border-radius: 18px;
+  font-family: "Roboto", Arial, sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: transform 0.1s ease, box-shadow 0.1s ease, opacity 0.2s ease;
+  user-select: none;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.ru-yt-translate-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(255, 87, 34, 0.4);
+}
+
+.ru-yt-translate-btn:active {
+  transform: translateY(0);
+}
+
+.ru-yt-translate-btn[data-state="loading"] {
+  background: linear-gradient(135deg, #ffa726 0%, #f57c00 100%);
+  pointer-events: none;
+}
+
+.ru-yt-translate-btn[data-state="active"] {
+  background: linear-gradient(135deg, #43a047 0%, #2e7d32 100%);
+}
+
+.ru-yt-translate-btn[data-state="error"] {
+  background: linear-gradient(135deg, #e53935 0%, #b71c1c 100%);
+}
+
+.ru-yt-translate-btn .ru-yt-translate-icon {
+  font-size: 16px;
+  line-height: 1;
+}
+
+.ru-yt-translate-toast {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 99999;
+  padding: 10px 16px;
+  background: rgba(33, 33, 33, 0.95);
+  color: #fff;
+  border-radius: 8px;
+  font-family: "Roboto", Arial, sans-serif;
+  font-size: 13px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.25s ease;
+  max-width: 320px;
+}
+
+.ru-yt-translate-toast.is-visible {
+  opacity: 1;
+}
+
+.ru-yt-translate-status {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 2px 6px;
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 8px;
+  font-size: 11px;
+}

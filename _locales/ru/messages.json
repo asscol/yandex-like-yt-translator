@@ -1,0 +1,8 @@
+{
+  "extName": {
+    "message": "Переводчик YouTube на русский (озвучка)"
+  },
+  "extDescription": {
+    "message": "Переводит видео YouTube на русский язык голосом — как Яндекс.Браузер. MVP: субтитры + Web Speech TTS."
+  }
+}
