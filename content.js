@@ -281,12 +281,21 @@
       url = url.replace(/([?&])fmt=[^&]*/, "$1fmt=json3");
     }
 
-    const body = await fetchViaBackground(url);
+    // Try direct content-script fetch first (shares page cookies as same-origin
+    // to youtube.com), then fall back to the background-worker proxy.
+    let body = await fetchSubtitlesDirect(url).catch(() => null);
+    if (!body || body.trim().length === 0) {
+      body = await fetchViaBackground(url);
+    }
     let parsed;
     try {
       parsed = JSON.parse(body);
     } catch (e) {
-      throw new Error("subtitle response is not JSON3: " + e.message);
+      const preview = (body || "").slice(0, 80).replace(/\s+/g, " ");
+      throw new Error(
+        "subtitle response is not JSON3: " + e.message +
+        (preview ? ` (got: "${preview}")` : " (empty response)"),
+      );
     }
     const events = Array.isArray(parsed.events) ? parsed.events : [];
     /** @type {Array<{startMs:number,durMs:number,text:string}>} */
@@ -304,6 +313,12 @@
       segments.push({ startMs, durMs, text });
     }
     return segments;
+  }
+
+  async function fetchSubtitlesDirect(url) {
+    const resp = await fetch(url, { credentials: "include" });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    return await resp.text();
   }
 
   async function fetchViaBackground(url) {
@@ -603,9 +618,83 @@
     ctx._pauseHandler = null;
     ctx._playHandler = null;
     ctx._seekHandler = null;
+    if (ctx._liveObserver) {
+      try { ctx._liveObserver.disconnect(); } catch {}
+      ctx._liveObserver = null;
+    }
     if (video && ctx.wasMuted !== null) video.muted = ctx.wasMuted;
     ctx.wasMuted = null;
     ctx.activeIndex = -1;
+  }
+
+  // ------------------------------------------------------------------
+  // Live caption mode (fallback when timedtext API is blocked).
+  // Reads what YouTube renders inside .ytp-caption-segment in real time,
+  // translates each new caption block and speaks it.
+  // ------------------------------------------------------------------
+
+  function startLiveCaptionMode() {
+    const video = getVideoElement();
+    if (!video) {
+      showToast("Видео-элемент не найден");
+      setButtonState(STATE_ERROR, "Перевести");
+      return;
+    }
+    ctx.wasMuted = video.muted;
+    if (settings.autoMuteOriginal) video.muted = true;
+
+    let lastText = "";
+    let busy = false;
+    let pending = null;
+
+    const handleCaption = async (text) => {
+      if (busy) { pending = text; return; }
+      busy = true;
+      try {
+        const ru = await sendTranslate(text);
+        try { window.speechSynthesis.cancel(); } catch {}
+        const utt = new SpeechSynthesisUtterance(ru);
+        const voice = pickRussianVoice();
+        if (voice) { utt.voice = voice; utt.lang = voice.lang; }
+        else utt.lang = "ru-RU";
+        utt.volume = clamp(settings.volume, 0, 1);
+        utt.pitch = clamp(settings.pitch, 0.5, 2);
+        utt.rate = clamp(settings.rate, 0.5, 2.0);
+        ctx.speakingUtterance = utt;
+        window.speechSynthesis.speak(utt);
+      } catch (e) {
+        console.warn("[RU-YT] live translate failed:", e);
+      }
+      busy = false;
+      if (pending && pending !== lastText) {
+        const next = pending; pending = null; lastText = next;
+        handleCaption(next);
+      }
+    };
+
+    const scan = () => {
+      const segs = document.querySelectorAll(".ytp-caption-segment");
+      if (!segs.length) return;
+      const text = Array.from(segs)
+        .map((s) => (s.textContent || "").trim())
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!text || text === lastText) return;
+      lastText = text;
+      handleCaption(text);
+    };
+
+    const observer = new MutationObserver(scan);
+    observer.observe(document.body, {
+      childList: true, subtree: true, characterData: true,
+    });
+    ctx._liveObserver = observer;
+    // Initial scan in case captions are already visible.
+    scan();
+
+    setButtonState(STATE_ACTIVE, "Выключить");
   }
 
   // ------------------------------------------------------------------
@@ -640,15 +729,25 @@
       }
 
       const track = pickCaptionTrack(playerResponse);
-      if (!track) {
-        throw new Error(
-          "У этого видео нет субтитров (даже автоматических). Включите субтитры на YouTube или попробуйте другое видео.",
-        );
+      let segments = [];
+      if (track) {
+        try {
+          segments = await fetchTrackSegments(track);
+        } catch (e) {
+          console.warn("[RU-YT] timedtext fetch failed:", e);
+        }
       }
 
-      const segments = await fetchTrackSegments(track);
       if (segments.length === 0) {
-        throw new Error("Субтитры пустые.");
+        // YouTube increasingly blocks timedtext fetches client-side. Fall
+        // back to reading captions live from the player DOM — works whenever
+        // the user enables CC in YouTube's player.
+        showToast(
+          "YouTube не отдал JSON-субтитры. Включите CC в плеере — буду озвучивать видимые субтитры в реальном времени.",
+          5500,
+        );
+        startLiveCaptionMode();
+        return;
       }
 
       showToast(`Перевожу ${segments.length} реплик…`);

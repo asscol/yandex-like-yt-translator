@@ -20,7 +20,7 @@ async function translateText({ text, source = "en", target = "ru" }) {
 }
 
 async function fetchSubtitles({ url }) {
-  const resp = await fetch(url, { credentials: "omit" });
+  const resp = await fetch(url, { credentials: "include" });
   if (!resp.ok) {
     throw new Error(`Subtitles HTTP ${resp.status}`);
   }
