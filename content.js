@@ -673,34 +673,91 @@
     ctx.wasMuted = video.muted;
     if (settings.autoMuteOriginal) video.muted = true;
 
-    let lastText = "";
-    let busy = false;
-    let pending = null;
+    // ---- Live-mode pipeline overview ----------------------------------
+    // 1. MutationObserver fires whenever YouTube re-renders captions.
+    //    YouTube updates the same caption text many times (fade in, word-by-
+    //    word reveal, position change). To avoid translating + speaking on
+    //    every keystroke we *debounce*: wait for the text to stay constant
+    //    for CAPTION_STABLE_MS before committing.
+    // 2. When a stable text is committed, we diff it against the previously
+    //    committed text. If it strictly extends it (caption is being grown
+    //    word-by-word) we only enqueue the new tail; if it's a prefix of
+    //    something already spoken we drop it.
+    // 3. Translated phrases go into a sequential queue. We never interrupt
+    //    the currently-speaking utterance just because a new caption
+    //    arrived — that was the source of the "запинался / снова и снова
+    //    недоговаривая" bug. We only cancel on stop / pause / seek.
+    // -------------------------------------------------------------------
 
-    const handleCaption = async (text) => {
-      if (busy) { pending = text; return; }
-      busy = true;
+    const CAPTION_STABLE_MS = 350;
+
+    let pendingText = "";       // last text observed by scan()
+    let stableTimer = null;     // debounce timer
+    let lastCommitted = "";     // last text we forwarded to translate
+    /** @type {Array<string>} */
+    const ttsQueue = [];        // queued Russian phrases waiting to be spoken
+    let speaking = false;       // is the TTS engine currently playing?
+
+    const playNextInQueue = () => {
+      if (speaking) return;
+      if (ctx.state !== STATE_ACTIVE) return;
+      const text = ttsQueue.shift();
+      if (!text) return;
+      speaking = true;
+      const utt = new SpeechSynthesisUtterance(text);
+      const voice = pickRussianVoice();
+      if (voice) { utt.voice = voice; utt.lang = voice.lang; }
+      else utt.lang = "ru-RU";
+      utt.volume = clamp(settings.volume, 0, 1);
+      utt.pitch = clamp(settings.pitch, 0.5, 2);
+      utt.rate = clamp(settings.rate, 0.5, 2.0);
+      const finish = () => {
+        speaking = false;
+        ctx.speakingUtterance = null;
+        // Drain a few queued items in a row if they accumulated while we
+        // were speaking. The next call schedules itself recursively via
+        // utt.onend, so we only kick the pump if we're not already speaking.
+        playNextInQueue();
+      };
+      utt.onend = finish;
+      utt.onerror = finish;
+      ctx.speakingUtterance = utt;
+      try { window.speechSynthesis.speak(utt); }
+      catch (e) {
+        console.warn("[RU-YT] speak failed:", e);
+        finish();
+      }
+    };
+
+    const enqueueTranslated = async (text) => {
+      let ru;
       try {
-        const ru = await sendTranslate(text);
-        if (ctx.state !== STATE_ACTIVE) { busy = false; return; }
-        try { window.speechSynthesis.cancel(); } catch {}
-        const utt = new SpeechSynthesisUtterance(ru);
-        const voice = pickRussianVoice();
-        if (voice) { utt.voice = voice; utt.lang = voice.lang; }
-        else utt.lang = "ru-RU";
-        utt.volume = clamp(settings.volume, 0, 1);
-        utt.pitch = clamp(settings.pitch, 0.5, 2);
-        utt.rate = clamp(settings.rate, 0.5, 2.0);
-        ctx.speakingUtterance = utt;
-        window.speechSynthesis.speak(utt);
+        ru = await sendTranslate(text);
       } catch (e) {
         console.warn("[RU-YT] live translate failed:", e);
+        return;
       }
-      busy = false;
-      if (ctx.state === STATE_ACTIVE && pending && pending !== lastText) {
-        const next = pending; pending = null; lastText = next;
-        handleCaption(next);
+      if (ctx.state !== STATE_ACTIVE) return;
+      if (!ru || !ru.trim()) return;
+      ttsQueue.push(ru.trim());
+      playNextInQueue();
+    };
+
+    const commitCaption = (text) => {
+      if (!text || text === lastCommitted) return;
+      // If lastCommitted is a strict prefix of text → enqueue only the new
+      // tail (saves a duplicate of what we just said).
+      let toTranslate = text;
+      if (lastCommitted && text.startsWith(lastCommitted + " ")) {
+        toTranslate = text.slice(lastCommitted.length).trim();
+      } else if (lastCommitted && lastCommitted.startsWith(text)) {
+        // YouTube sometimes briefly shows a *prefix* of an earlier caption
+        // (e.g. when seeking by a few frames). Don't repeat ourselves.
+        return;
       }
+      lastCommitted = text;
+      if (!toTranslate) return;
+      enqueueTranslated(toTranslate);
     };
 
     const scan = () => {
@@ -712,9 +769,15 @@
         .join(" ")
         .replace(/\s+/g, " ")
         .trim();
-      if (!text || text === lastText) return;
-      lastText = text;
-      handleCaption(text);
+      if (!text || text === pendingText) return;
+      pendingText = text;
+      // Debounce: wait until the caption has been stable for a while before
+      // committing. Each new mutation pushes the deadline forward.
+      if (stableTimer) clearTimeout(stableTimer);
+      stableTimer = setTimeout(() => {
+        stableTimer = null;
+        commitCaption(pendingText);
+      }, CAPTION_STABLE_MS);
     };
 
     // Scope the observer to the caption container when present — observing
@@ -729,6 +792,15 @@
       childList: true, subtree: true, characterData: true,
     });
     ctx._liveObserver = observer;
+    ctx._liveStableTimerCancel = () => {
+      if (stableTimer) { clearTimeout(stableTimer); stableTimer = null; }
+    };
+    ctx._liveQueueClear = () => {
+      ttsQueue.length = 0;
+      pendingText = "";
+      lastCommitted = "";
+      speaking = false;
+    };
 
     // Mirror startPlayback() so TTS follows pause / play / seek of the video.
     const pauseHandler = () => {
@@ -738,9 +810,10 @@
       try { window.speechSynthesis.resume(); } catch {}
     };
     const seekHandler = () => {
+      // Seek invalidates everything we have queued — drop it.
       try { window.speechSynthesis.cancel(); } catch {}
-      lastText = "";
-      pending = null;
+      ctx._liveStableTimerCancel?.();
+      ctx._liveQueueClear?.();
     };
     video.addEventListener("pause", pauseHandler);
     video.addEventListener("play", playHandler);
