@@ -65,7 +65,13 @@
     });
   }
 
-  // Listen for live setting updates from the popup.
+  // Listen for live setting updates from the popup. Guarded because the
+  // chrome.runtime APIs throw "Extension context invalidated" once the
+  // extension is reloaded while a content script is still attached.
+  function isExtensionContextValid() {
+    try { return !!(chrome && chrome.runtime && chrome.runtime.id); }
+    catch { return false; }
+  }
   try {
     chrome.runtime.onMessage.addListener((msg) => {
       if (msg && msg.type === "ru-yt-settings-updated" && msg.payload) {
@@ -112,6 +118,21 @@
 
     if (ctx.button && document.contains(ctx.button)) return;
 
+    // Adopt an existing button if one already exists in the DOM (e.g. after
+    // a SPA nav re-rendered the actions row but our reference was lost).
+    // Without this guard we end up rendering several buttons stacked.
+    const existing = document.querySelector(".ru-yt-translate-btn");
+    if (existing) {
+      // Re-attach the click handler in case it was lost (e.g. element
+      // survived but our isolated-world listener was GC'd after reload).
+      if (!existing.dataset.ruYtBound) {
+        existing.addEventListener("click", onButtonClick);
+        existing.dataset.ruYtBound = "1";
+      }
+      ctx.button = existing;
+      return;
+    }
+
     // Mount inside the right side of the player controls if available; fall
     // back to the title actions row.
     const mountSpots = [
@@ -136,6 +157,7 @@
       '<span class="ru-yt-translate-icon">🎙</span>' +
       '<span class="ru-yt-translate-label">Перевести</span>';
     btn.addEventListener("click", onButtonClick);
+    btn.dataset.ruYtBound = "1";
     mount.prepend(btn);
     ctx.button = btn;
   }
@@ -323,6 +345,10 @@
 
   async function fetchViaBackground(url) {
     return new Promise((resolve, reject) => {
+      if (!isExtensionContextValid()) {
+        reject(new Error("extension context invalidated — reload the page"));
+        return;
+      }
       try {
         chrome.runtime.sendMessage(
           { type: "ru-yt-fetch-subs", payload: { url } },
@@ -441,6 +467,10 @@
 
   function sendTranslate(text) {
     return new Promise((resolve, reject) => {
+      if (!isExtensionContextValid()) {
+        reject(new Error("extension context invalidated — reload the page"));
+        return;
+      }
       try {
         chrome.runtime.sendMessage(
           {
@@ -687,8 +717,15 @@
       handleCaption(text);
     };
 
+    // Scope the observer to the caption container when present — observing
+    // the entire <body> fires on every YouTube DOM mutation (heavy on perf).
+    const captionRoot =
+      document.querySelector(".caption-window") ||
+      document.querySelector(".ytp-caption-window-container") ||
+      document.querySelector("#movie_player") ||
+      document.body;
     const observer = new MutationObserver(scan);
-    observer.observe(document.body, {
+    observer.observe(captionRoot, {
       childList: true, subtree: true, characterData: true,
     });
     ctx._liveObserver = observer;
@@ -807,7 +844,9 @@
 
   function setupNavigationObserver() {
     let lastHref = location.href;
+    let scheduled = false;
     const check = () => {
+      scheduled = false;
       if (location.href !== lastHref) {
         lastHref = location.href;
         onUrlChange();
@@ -815,7 +854,14 @@
         ensureButton();
       }
     };
-    const observer = new MutationObserver(check);
+    const schedule = () => {
+      if (scheduled) return;
+      scheduled = true;
+      // Throttle to one rAF — observing all DOM mutations on YouTube fires
+      // hundreds of times per second; we only need to react eventually.
+      requestAnimationFrame(check);
+    };
+    const observer = new MutationObserver(schedule);
     observer.observe(document.documentElement, { childList: true, subtree: true });
 
     document.addEventListener("yt-navigate-finish", onUrlChange, { capture: true });
