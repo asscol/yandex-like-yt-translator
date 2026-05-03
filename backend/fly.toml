@@ -1,0 +1,49 @@
+# Fly.io deployment config for the ru-yt-translator backend.
+#
+#   flyctl launch --no-deploy --name ru-yt-translator
+#   flyctl volumes create models --region fra --size 5
+#   flyctl deploy
+#
+# We default to a 4 GB RAM / 2 CPU `shared-cpu-2x` machine because XTTS-v2
+# refuses to load on the 256 MB free tier.  The `auto_stop_machines` flag
+# means the VM hibernates between requests, so the bill stays close to $0
+# when nobody's translating videos.
+
+app = "ru-yt-translator"
+primary_region = "fra"
+kill_signal = "SIGINT"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8000"
+  FW_MODEL = "base"
+  FW_COMPUTE_TYPE = "int8"
+  FW_DEVICE = "cpu"
+  MAX_VIDEO_SECONDS = "600"
+
+[[mounts]]
+  source = "models"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "30s"
+    method = "GET"
+    path = "/healthz"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 2
+  memory_mb = 4096

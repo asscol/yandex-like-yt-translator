@@ -1,0 +1,12 @@
+__pycache__
+*.pyc
+*.pyo
+.venv
+.env
+.pytest_cache
+.ruff_cache
+.mypy_cache
+tests
+*.md
+data
+node_modules
