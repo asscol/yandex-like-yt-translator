@@ -25,6 +25,8 @@
     autoMuteOriginal: true,
     sourceLang: "auto", // "auto" | "en"
     targetLang: "ru",
+    ttsEngine: "browser", // "browser" | "backend"
+    backendUrl: "",
   };
 
   /** @type {{
@@ -37,6 +39,10 @@
    *   timeupdateHandler: ((e:Event)=>void)|null,
    *   navHandler: (()=>void)|null,
    *   speakingUtterance: SpeechSynthesisUtterance|null,
+   *   backendAudio: HTMLAudioElement|null,
+   *   backendSyncCleanup: (()=>void)|null,
+   *   backendJobId: string|null,
+   *   backendCancel: AbortController|null,
    * }} */
   const ctx = {
     button: null,
@@ -48,6 +54,10 @@
     timeupdateHandler: null,
     navHandler: null,
     speakingUtterance: null,
+    backendAudio: null,
+    backendSyncCleanup: null,
+    backendJobId: null,
+    backendCancel: null,
   };
 
   let settings = { ...DEFAULT_SETTINGS };
@@ -652,6 +662,27 @@
       try { ctx._liveObserver.disconnect(); } catch {}
       ctx._liveObserver = null;
     }
+    // Backend audio cleanup.
+    if (ctx.backendCancel) {
+      try { ctx.backendCancel.abort(); } catch {}
+      ctx.backendCancel = null;
+    }
+    if (ctx.backendSyncCleanup) {
+      try { ctx.backendSyncCleanup(); } catch {}
+      ctx.backendSyncCleanup = null;
+    }
+    if (ctx.backendAudio) {
+      try {
+        ctx.backendAudio.pause();
+        if (ctx.backendAudio.src && ctx.backendAudio.src.startsWith("blob:")) {
+          URL.revokeObjectURL(ctx.backendAudio.src);
+        }
+        ctx.backendAudio.src = "";
+        ctx.backendAudio.remove();
+      } catch {}
+      ctx.backendAudio = null;
+    }
+    ctx.backendJobId = null;
     if (video && ctx.wasMuted !== null) video.muted = ctx.wasMuted;
     ctx.wasMuted = null;
     ctx.activeIndex = -1;
@@ -759,6 +790,158 @@
   // Click handler
   // ------------------------------------------------------------------
 
+  // ------------------------------------------------------------------
+  // Backend mode ("живые голоса"): full-pipeline translate + voice clone
+  // delegated to a self-hosted FastAPI service (see backend/).
+  //
+  // Flow:
+  //   1. POST /jobs/translate-video {video_url, target_lang}
+  //   2. Poll /jobs/{id} until stage=done (with progress tickers)
+  //   3. Fetch /jobs/{id}/audio as a blob, attach to a hidden <audio>
+  //   4. Mute the original video and play the audio in sync (play/pause/seek
+  //      events on <video> are mirrored to <audio>).
+  // ------------------------------------------------------------------
+
+  function backendBaseUrl() {
+    const raw = (settings.backendUrl || "").trim();
+    if (!raw) return "";
+    return raw.replace(/\/+$/, "");
+  }
+
+  async function backendCreateJob(videoUrl, targetLang, signal) {
+    const base = backendBaseUrl();
+    if (!base) throw new Error("Бэкенд не настроен. Откройте попап и укажите URL.");
+    const resp = await fetch(`${base}/jobs/translate-video`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ video_url: videoUrl, target_lang: targetLang || "ru" }),
+      signal,
+    });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw new Error(`Бэкенд: ${resp.status} ${text.slice(0, 200)}`);
+    }
+    return await resp.json();
+  }
+
+  async function backendPollUntilDone(jobId, signal, onProgress) {
+    const base = backendBaseUrl();
+    let lastStage = "";
+    while (true) {
+      if (signal && signal.aborted) throw new DOMException("aborted", "AbortError");
+      const resp = await fetch(`${base}/jobs/${jobId}`, {
+        method: "GET",
+        cache: "no-store",
+        signal,
+      });
+      if (!resp.ok) throw new Error(`Бэкенд: статус задания ${resp.status}`);
+      const data = await resp.json();
+      if (data.stage !== lastStage) {
+        lastStage = data.stage;
+      }
+      if (typeof onProgress === "function") {
+        onProgress(data);
+      }
+      if (data.stage === "done") return data;
+      if (data.stage === "error") throw new Error(data.error || "Бэкенд вернул ошибку");
+      await new Promise((res) => setTimeout(res, 2000));
+    }
+  }
+
+  async function backendDownloadAudio(jobId, signal) {
+    const base = backendBaseUrl();
+    const resp = await fetch(`${base}/jobs/${jobId}/audio`, { signal });
+    if (!resp.ok) throw new Error(`Бэкенд: не удалось скачать аудио (${resp.status})`);
+    return await resp.blob();
+  }
+
+  function attachBackendAudioToVideo(audio, video) {
+    // Mirror video play/pause/seek/rate onto the audio element.
+    const onPlay = () => audio.play().catch(() => {});
+    const onPause = () => audio.pause();
+    const onSeeking = () => {
+      try { audio.currentTime = video.currentTime; } catch {}
+    };
+    const onRate = () => {
+      try { audio.playbackRate = video.playbackRate; } catch {}
+    };
+    video.addEventListener("play", onPlay);
+    video.addEventListener("pause", onPause);
+    video.addEventListener("seeking", onSeeking);
+    video.addEventListener("ratechange", onRate);
+
+    // Initial sync.
+    try {
+      audio.currentTime = video.currentTime;
+      audio.playbackRate = video.playbackRate;
+    } catch {}
+
+    if (!video.paused) {
+      audio.play().catch(() => {});
+    }
+
+    return () => {
+      video.removeEventListener("play", onPlay);
+      video.removeEventListener("pause", onPause);
+      video.removeEventListener("seeking", onSeeking);
+      video.removeEventListener("ratechange", onRate);
+    };
+  }
+
+  async function startBackendMode() {
+    const video = getVideoElement();
+    if (!video) throw new Error("Видео-элемент не найден");
+    const videoUrl = location.href;
+
+    const ac = new AbortController();
+    ctx.backendCancel = ac;
+
+    showToast("Отправляю видео на бэкенд…", 3500);
+    const created = await backendCreateJob(videoUrl, settings.targetLang || "ru", ac.signal);
+    ctx.backendJobId = created.id;
+
+    showToast(`Бэкенд принял задание (${created.id}). Ждём результат…`, 4000);
+    const stageLabel = {
+      queued: "В очереди",
+      downloading: "Скачивание видео",
+      transcribing: "Распознавание речи",
+      translating: "Перевод текста",
+      extracting_voice: "Извлечение голоса",
+      synthesizing: "Синтез речи",
+    };
+    await backendPollUntilDone(created.id, ac.signal, (data) => {
+      if (ctx.button) {
+        const labelEl = ctx.button.querySelector(".ru-yt-translate-label");
+        if (labelEl) {
+          const pct = Math.round((data.overall || 0) * 100);
+          const stage = stageLabel[data.stage] || data.stage;
+          labelEl.textContent = `${stage}… ${pct}%`;
+        }
+      }
+    });
+
+    showToast("Скачиваю синтезированное аудио…", 2500);
+    const blob = await backendDownloadAudio(created.id, ac.signal);
+    const url = URL.createObjectURL(blob);
+
+    const audio = document.createElement("audio");
+    audio.preload = "auto";
+    audio.src = url;
+    audio.crossOrigin = "anonymous";
+    audio.style.display = "none";
+    document.body.appendChild(audio);
+    ctx.backendAudio = audio;
+
+    if (ctx.wasMuted === null) ctx.wasMuted = video.muted;
+    if (settings.autoMuteOriginal) video.muted = true;
+    audio.volume = clamp(settings.volume, 0, 1);
+
+    ctx.backendSyncCleanup = attachBackendAudioToVideo(audio, video);
+
+    setButtonState(STATE_ACTIVE, "Выключить");
+    showToast("Бэкенд готов. Озвучка играет синхронно с видео.", 4000);
+  }
+
   async function onButtonClick() {
     if (ctx.state === STATE_ACTIVE) {
       stopPlayback();
@@ -769,10 +952,20 @@
     if (ctx.state === STATE_LOADING) return;
 
     setButtonState(STATE_LOADING, "Готовлю…");
-    showToast("Скачиваю субтитры…");
 
     try {
       await loadSettings();
+
+      // Backend mode (full-pipeline live voices) takes a different path: it
+      // sends the video URL to the FastAPI service which does Whisper +
+      // translate + XTTS-v2 voice cloning, and we play the resulting WAV
+      // synced to the <video> element.
+      if (settings.ttsEngine === "backend") {
+        await startBackendMode();
+        return;
+      }
+
+      showToast("Скачиваю субтитры…");
 
       const videoId = getCurrentVideoId();
       if (!videoId) throw new Error("Это не страница видео.");

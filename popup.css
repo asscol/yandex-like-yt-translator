@@ -37,6 +37,37 @@ label.inline {
   cursor: pointer;
 }
 
+.engine-toggle {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+input[type="url"] {
+  width: 100%;
+  padding: 6px 8px;
+  font-size: 12px;
+  border: 1px solid #cfcfcf;
+  border-radius: 6px;
+  box-sizing: border-box;
+  font-family: inherit;
+}
+
+.muted {
+  color: #757575;
+  font-size: 11px;
+  margin: 4px 0 0;
+  line-height: 1.35;
+}
+
+.muted code {
+  background: #f3f3f3;
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+
 .value {
   float: right;
   font-weight: 400;

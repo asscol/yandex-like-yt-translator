@@ -2,14 +2,17 @@
   "manifest_version": 3,
   "name": "YouTube Russian Voice Translator",
   "short_name": "RU YT Translator",
-  "version": "0.1.0",
-  "description": "Переводит YouTube-видео на русский язык голосом (как в Яндекс.Браузере). MVP: субтитры + Web Speech TTS.",
+  "version": "0.2.0",
+  "description": "Переводит YouTube-видео на русский язык голосом. Поддерживает Web Speech и собственный бэкенд (Whisper + XTTS-v2 «живые голоса»).",
   "default_locale": "ru",
   "permissions": ["storage"],
   "host_permissions": [
     "*://*.youtube.com/*",
     "*://www.youtube.com/*",
-    "*://translate.googleapis.com/*"
+    "*://translate.googleapis.com/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*",
+    "https://*.fly.dev/*"
   ],
   "action": {
     "default_popup": "popup.html",
