@@ -13,7 +13,22 @@
 
     <main>
       <section>
-        <label for="voice">Русский голос</label>
+        <label>Движок голоса</label>
+        <div class="engine-toggle">
+          <label class="inline">
+            <input type="radio" name="tts-engine" value="browser" />
+            <span>Браузер (быстро, низкое качество)</span>
+          </label>
+          <label class="inline">
+            <input type="radio" name="tts-engine" value="piper" />
+            <span>Piper Ruslan (нейросеть, ~60 МБ)</span>
+          </label>
+        </div>
+        <p class="muted" id="piper-status"></p>
+      </section>
+
+      <section id="browser-voice-section">
+        <label for="voice">Русский голос (браузер)</label>
         <select id="voice"></select>
         <button id="test-voice" type="button" class="secondary">Проверить голос</button>
       </section>

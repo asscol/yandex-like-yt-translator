@@ -6,6 +6,8 @@ const DEFAULTS = {
   volume: 1.0,
   voiceURI: "",
   autoMuteOriginal: true,
+  ttsEngine: "browser",
+  piperVoice: "ru_RU-ruslan-medium",
 };
 
 const els = {
@@ -19,6 +21,9 @@ const els = {
   autoMute: document.getElementById("auto-mute"),
   save: document.getElementById("save"),
   testVoice: document.getElementById("test-voice"),
+  engineRadios: document.querySelectorAll('input[name="tts-engine"]'),
+  browserVoiceSection: document.getElementById("browser-voice-section"),
+  piperStatus: document.getElementById("piper-status"),
 };
 
 function fmtPct(v) {
@@ -87,12 +92,16 @@ function bindRangeDisplay() {
 }
 
 function readForm() {
+  let engine = "browser";
+  for (const r of els.engineRadios) if (r.checked) engine = r.value;
   return {
     rate: parseFloat(els.rate.value),
     pitch: parseFloat(els.pitch.value),
     volume: parseFloat(els.volume.value),
     voiceURI: els.voice.value || "",
     autoMuteOriginal: els.autoMute.checked,
+    ttsEngine: engine,
+    piperVoice: "ru_RU-ruslan-medium",
   };
 }
 
@@ -104,6 +113,22 @@ function writeForm(s) {
   els.volume.value = s.volume;
   els.volumeValue.textContent = fmtPct(s.volume);
   els.autoMute.checked = !!s.autoMuteOriginal;
+  const engine = s.ttsEngine === "piper" ? "piper" : "browser";
+  for (const r of els.engineRadios) r.checked = (r.value === engine);
+  applyEngineUI(engine);
+}
+
+function applyEngineUI(engine) {
+  if (engine === "piper") {
+    els.browserVoiceSection.style.opacity = "0.5";
+    els.browserVoiceSection.style.pointerEvents = "none";
+    els.piperStatus.textContent =
+      "Piper загрузит голос Ruslan (~60 МБ) с huggingface.co при первом включении перевода. После этого работает офлайн.";
+  } else {
+    els.browserVoiceSection.style.opacity = "";
+    els.browserVoiceSection.style.pointerEvents = "";
+    els.piperStatus.textContent = "";
+  }
 }
 
 async function init() {
@@ -114,6 +139,11 @@ async function init() {
   writeForm(stored);
   const voices = await loadVoices();
   populateVoices(voices, stored.voiceURI);
+  for (const r of els.engineRadios) {
+    r.addEventListener("change", () => {
+      if (r.checked) applyEngineUI(r.value);
+    });
+  }
 
   els.save.addEventListener("click", async () => {
     const settings = readForm();
