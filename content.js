@@ -652,6 +652,7 @@
       busy = true;
       try {
         const ru = await sendTranslate(text);
+        if (ctx.state !== STATE_ACTIVE) { busy = false; return; }
         try { window.speechSynthesis.cancel(); } catch {}
         const utt = new SpeechSynthesisUtterance(ru);
         const voice = pickRussianVoice();
@@ -666,7 +667,7 @@
         console.warn("[RU-YT] live translate failed:", e);
       }
       busy = false;
-      if (pending && pending !== lastText) {
+      if (ctx.state === STATE_ACTIVE && pending && pending !== lastText) {
         const next = pending; pending = null; lastText = next;
         handleCaption(next);
       }
@@ -691,6 +692,26 @@
       childList: true, subtree: true, characterData: true,
     });
     ctx._liveObserver = observer;
+
+    // Mirror startPlayback() so TTS follows pause / play / seek of the video.
+    const pauseHandler = () => {
+      try { window.speechSynthesis.pause(); } catch {}
+    };
+    const playHandler = () => {
+      try { window.speechSynthesis.resume(); } catch {}
+    };
+    const seekHandler = () => {
+      try { window.speechSynthesis.cancel(); } catch {}
+      lastText = "";
+      pending = null;
+    };
+    video.addEventListener("pause", pauseHandler);
+    video.addEventListener("play", playHandler);
+    video.addEventListener("seeking", seekHandler);
+    ctx._pauseHandler = pauseHandler;
+    ctx._playHandler = playHandler;
+    ctx._seekHandler = seekHandler;
+
     // Initial scan in case captions are already visible.
     scan();
 
