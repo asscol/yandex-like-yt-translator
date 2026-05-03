@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Russian Voice Translator",
+  "short_name": "RU YT Translator",
+  "version": "0.1.0",
+  "description": "Переводит YouTube-видео на русский язык голосом (как в Яндекс.Браузере). MVP: субтитры + Web Speech TTS.",
+  "default_locale": "ru",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "*://*.youtube.com/*",
+    "*://www.youtube.com/*",
+    "*://translate.googleapis.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.youtube.com/*"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["injected.js"],
+      "matches": ["*://*.youtube.com/*"]
+    }
+  ]
+}

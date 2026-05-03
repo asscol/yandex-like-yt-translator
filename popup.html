@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <title>Настройки переводчика</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <h1>YouTube → Русский</h1>
+      <p class="subtitle">Озвучка видео на русском языке</p>
+    </header>
+
+    <main>
+      <section>
+        <label for="voice">Русский голос</label>
+        <select id="voice"></select>
+        <button id="test-voice" type="button" class="secondary">Проверить голос</button>
+      </section>
+
+      <section>
+        <label for="rate">Скорость <span class="value" id="rate-value">1.05×</span></label>
+        <input type="range" id="rate" min="0.5" max="2" step="0.05" value="1.05" />
+      </section>
+
+      <section>
+        <label for="volume">Громкость <span class="value" id="volume-value">100%</span></label>
+        <input type="range" id="volume" min="0" max="1" step="0.05" value="1" />
+      </section>
+
+      <section>
+        <label for="pitch">Тон <span class="value" id="pitch-value">1.00</span></label>
+        <input type="range" id="pitch" min="0.5" max="2" step="0.05" value="1" />
+      </section>
+
+      <section class="row">
+        <label for="auto-mute" class="inline">
+          <input type="checkbox" id="auto-mute" checked />
+          <span>Заглушать оригинал автоматически</span>
+        </label>
+      </section>
+
+      <section>
+        <button id="save" type="button" class="primary">Сохранить</button>
+      </section>
+
+      <section class="hint">
+        <p>
+          Зайди на любое видео <a href="https://www.youtube.com" target="_blank">YouTube</a>
+          и нажми кнопку «🎙 Перевести» рядом с лайками.
+        </p>
+        <p class="muted">Работает на видео с субтитрами (включая автоматические).</p>
+      </section>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
