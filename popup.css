@@ -91,3 +91,17 @@ button.secondary:hover { background: #e0e0e0; }
   color: #2e7d32;
   min-height: 14px;
 }
+
+.engine-toggle {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+.engine-toggle label.inline {
+  font-size: 12px;
+}
+#piper-status {
+  margin-top: 6px;
+  line-height: 1.35;
+}

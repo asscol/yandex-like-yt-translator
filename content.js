@@ -25,6 +25,10 @@
     autoMuteOriginal: true,
     sourceLang: "auto", // "auto" | "en"
     targetLang: "ru",
+    // "browser" → Web Speech API (low quality, depends on OS voices).
+    // "piper"   → Piper neural TTS via offscreen document (Ruslan voice).
+    ttsEngine: "browser",
+    piperVoice: "ru_RU-ruslan-medium",
   };
 
   /** @type {{
@@ -501,6 +505,171 @@
   // Speech / playback
   // ------------------------------------------------------------------
 
+  // Engine-agnostic TTS layer. Two backends:
+  //   * "browser": Web Speech API (SpeechSynthesisUtterance).
+  //   * "piper":   Piper neural TTS via offscreen document. The content
+  //                script never touches WASM directly — it dispatches a
+  //                ru-yt-piper message through the service worker, which
+  //                forwards it to the offscreen doc. The offscreen doc
+  //                synthesizes, plays the audio, and resolves when playback
+  //                ends; the resolution travels back as the message reply.
+  //
+  // speakRussian() returns a Promise that fulfils when the audio playback
+  // for that phrase is finished (or the TTS engine reports an error). Use
+  // this primitive to drive a sequential queue.
+
+  let piperPreloadPromise = null;
+  let piperPreloadShownProgress = 0;
+  let piperSpeakSeq = 0;
+
+  function piperEnabled() {
+    return settings.ttsEngine === "piper";
+  }
+
+  function ensurePiperVoice() {
+    if (piperPreloadPromise) return piperPreloadPromise;
+    piperPreloadPromise = new Promise((resolve, reject) => {
+      if (!isExtensionContextValid()) {
+        return reject(new Error("extension context invalidated"));
+      }
+      chrome.runtime.sendMessage(
+        {
+          type: "ru-yt-piper",
+          payload: { type: "preload", voiceId: settings.piperVoice },
+        },
+        (resp) => {
+          if (chrome.runtime.lastError) {
+            return reject(new Error(chrome.runtime.lastError.message));
+          }
+          if (!resp || !resp.ok) {
+            return reject(new Error((resp && resp.error) || "preload failed"));
+          }
+          resolve();
+        },
+      );
+    }).catch((e) => {
+      // Allow a retry on the next call.
+      piperPreloadPromise = null;
+      throw e;
+    });
+    return piperPreloadPromise;
+  }
+
+  // Listen for the offscreen doc's progress updates and surface them as
+  // toasts so the user sees something during the ~60 MB Ruslan download.
+  try {
+    chrome.runtime.onMessage.addListener((msg) => {
+      if (!msg || msg.target !== "ru-yt-content") return false;
+      if (msg.type === "piper-progress") {
+        const pct = msg.total > 0 ? Math.floor((msg.loaded / msg.total) * 100) : 0;
+        if (pct === 100 || pct - piperPreloadShownProgress >= 10) {
+          piperPreloadShownProgress = pct;
+          showToast(`Загрузка голоса Ruslan: ${pct}%`, 1500);
+        }
+      }
+      return false;
+    });
+  } catch {}
+
+  function speakRussianViaPiper(text, opts) {
+    return new Promise((resolve, reject) => {
+      if (!isExtensionContextValid()) {
+        return reject(new Error("extension context invalidated"));
+      }
+      const id = ++piperSpeakSeq;
+      chrome.runtime.sendMessage(
+        {
+          type: "ru-yt-piper",
+          payload: {
+            type: "speak",
+            id,
+            text,
+            voiceId: settings.piperVoice,
+            rate: opts && typeof opts.rate === "number" ? opts.rate : settings.rate,
+            volume: opts && typeof opts.volume === "number" ? opts.volume : settings.volume,
+          },
+        },
+        (resp) => {
+          if (chrome.runtime.lastError) {
+            return reject(new Error(chrome.runtime.lastError.message));
+          }
+          if (!resp || !resp.ok) {
+            return reject(new Error((resp && resp.error) || "piper speak failed"));
+          }
+          resolve();
+        },
+      );
+    });
+  }
+
+  function speakRussianViaBrowser(text, opts) {
+    return new Promise((resolve) => {
+      const utt = new SpeechSynthesisUtterance(text);
+      const voice = pickRussianVoice();
+      if (voice) { utt.voice = voice; utt.lang = voice.lang; }
+      else utt.lang = "ru-RU";
+      utt.volume = clamp((opts && opts.volume) ?? settings.volume, 0, 1);
+      utt.pitch = clamp((opts && opts.pitch) ?? settings.pitch, 0.5, 2);
+      utt.rate = clamp((opts && opts.rate) ?? settings.rate, 0.5, 2.0);
+      const finish = () => resolve();
+      utt.onend = finish;
+      utt.onerror = finish;
+      ctx.speakingUtterance = utt;
+      try { window.speechSynthesis.speak(utt); }
+      catch (e) { console.warn("[RU-YT] speak failed:", e); finish(); }
+    });
+  }
+
+  async function speakRussian(text, opts) {
+    if (!text) return;
+    if (piperEnabled()) {
+      try {
+        await ensurePiperVoice();
+        return await speakRussianViaPiper(text, opts);
+      } catch (e) {
+        console.warn("[RU-YT] piper failed, falling back to browser TTS:", e);
+        showToast("Piper недоступен, использую системный голос", 2500);
+      }
+    }
+    return speakRussianViaBrowser(text, opts);
+  }
+
+  function cancelTts() {
+    try { window.speechSynthesis.cancel(); } catch {}
+    if (piperEnabled() && isExtensionContextValid()) {
+      try {
+        chrome.runtime.sendMessage(
+          { type: "ru-yt-piper", payload: { type: "cancel" } },
+          () => void chrome.runtime.lastError,
+        );
+      } catch {}
+    }
+  }
+
+  function pauseTts() {
+    try { window.speechSynthesis.pause(); } catch {}
+    if (piperEnabled() && isExtensionContextValid()) {
+      try {
+        chrome.runtime.sendMessage(
+          { type: "ru-yt-piper", payload: { type: "pause" } },
+          () => void chrome.runtime.lastError,
+        );
+      } catch {}
+    }
+  }
+
+  function resumeTts() {
+    try { window.speechSynthesis.resume(); } catch {}
+    if (piperEnabled() && isExtensionContextValid()) {
+      try {
+        chrome.runtime.sendMessage(
+          { type: "ru-yt-piper", payload: { type: "resume" } },
+          () => void chrome.runtime.lastError,
+        );
+      } catch {}
+    }
+  }
+
   function pickRussianVoice() {
     const voices = window.speechSynthesis.getVoices();
     if (settings.voiceURI) {
@@ -526,22 +695,9 @@
     return null;
   }
 
-  function speakSegment(seg, video) {
+  function speakSegment(seg, _video) {
     if (!seg || !seg.ru) return;
-    try {
-      window.speechSynthesis.cancel();
-    } catch {}
-
-    const utt = new SpeechSynthesisUtterance(seg.ru);
-    const voice = pickRussianVoice();
-    if (voice) {
-      utt.voice = voice;
-      utt.lang = voice.lang;
-    } else {
-      utt.lang = "ru-RU";
-    }
-    utt.volume = clamp(settings.volume, 0, 1);
-    utt.pitch = clamp(settings.pitch, 0.5, 2);
+    cancelTts();
 
     // Auto-adapt rate so a long Russian phrase still fits inside the segment
     // duration. Russian translation is typically ~1.2x longer than English.
@@ -550,17 +706,12 @@
     let rate = baseRate;
     if (charsPerSec > 16) rate = Math.min(2.0, baseRate * 1.25);
     if (charsPerSec > 22) rate = Math.min(2.0, baseRate * 1.5);
-    utt.rate = rate;
 
-    ctx.speakingUtterance = utt;
-    utt.onend = () => {
-      if (ctx.speakingUtterance === utt) ctx.speakingUtterance = null;
-    };
-    utt.onerror = () => {
-      if (ctx.speakingUtterance === utt) ctx.speakingUtterance = null;
-    };
-
-    window.speechSynthesis.speak(utt);
+    speakRussian(seg.ru, { rate }).catch((e) => {
+      if (!/cancelled/i.test(String(e && e.message))) {
+        console.warn("[RU-YT] segmented speak failed:", e);
+      }
+    });
   }
 
   function clamp(v, lo, hi) {
@@ -603,20 +754,10 @@
         speakSegment(ctx.segments[idx], video);
       }
     };
-    const pauseHandler = () => {
-      try {
-        window.speechSynthesis.pause();
-      } catch {}
-    };
-    const playHandler = () => {
-      try {
-        window.speechSynthesis.resume();
-      } catch {}
-    };
+    const pauseHandler = () => pauseTts();
+    const playHandler = () => resumeTts();
     const seekHandler = () => {
-      try {
-        window.speechSynthesis.cancel();
-      } catch {}
+      cancelTts();
       ctx.activeIndex = -1;
     };
 
@@ -634,9 +775,7 @@
   }
 
   function stopPlayback() {
-    try {
-      window.speechSynthesis.cancel();
-    } catch {}
+    cancelTts();
     const video = getVideoElement();
     if (video && ctx.timeupdateHandler) {
       video.removeEventListener("timeupdate", ctx.timeupdateHandler);
@@ -673,34 +812,81 @@
     ctx.wasMuted = video.muted;
     if (settings.autoMuteOriginal) video.muted = true;
 
-    let lastText = "";
-    let busy = false;
-    let pending = null;
+    // ---- Live-mode pipeline overview ----------------------------------
+    // 1. MutationObserver fires whenever YouTube re-renders captions.
+    //    YouTube updates the same caption text many times (fade in, word-by-
+    //    word reveal, position change). To avoid translating + speaking on
+    //    every keystroke we *debounce*: wait for the text to stay constant
+    //    for CAPTION_STABLE_MS before committing.
+    // 2. When a stable text is committed, we diff it against the previously
+    //    committed text. If it strictly extends it (caption is being grown
+    //    word-by-word) we only enqueue the new tail; if it's a prefix of
+    //    something already spoken we drop it.
+    // 3. Translated phrases go into a sequential queue. We never interrupt
+    //    the currently-speaking utterance just because a new caption
+    //    arrived — that was the source of the "запинался / снова и снова
+    //    недоговаривая" bug. We only cancel on stop / pause / seek.
+    // -------------------------------------------------------------------
 
-    const handleCaption = async (text) => {
-      if (busy) { pending = text; return; }
-      busy = true;
+    const CAPTION_STABLE_MS = 350;
+
+    let pendingText = "";       // last text observed by scan()
+    let stableTimer = null;     // debounce timer
+    let lastCommitted = "";     // last text we forwarded to translate
+    /** @type {Array<string>} */
+    const ttsQueue = [];        // queued Russian phrases waiting to be spoken
+    let speaking = false;       // is the TTS engine currently playing?
+
+    const playNextInQueue = async () => {
+      if (speaking) return;
+      if (ctx.state !== STATE_ACTIVE) return;
+      const text = ttsQueue.shift();
+      if (!text) return;
+      speaking = true;
       try {
-        const ru = await sendTranslate(text);
-        if (ctx.state !== STATE_ACTIVE) { busy = false; return; }
-        try { window.speechSynthesis.cancel(); } catch {}
-        const utt = new SpeechSynthesisUtterance(ru);
-        const voice = pickRussianVoice();
-        if (voice) { utt.voice = voice; utt.lang = voice.lang; }
-        else utt.lang = "ru-RU";
-        utt.volume = clamp(settings.volume, 0, 1);
-        utt.pitch = clamp(settings.pitch, 0.5, 2);
-        utt.rate = clamp(settings.rate, 0.5, 2.0);
-        ctx.speakingUtterance = utt;
-        window.speechSynthesis.speak(utt);
+        await speakRussian(text);
+      } catch (e) {
+        // "cancelled" is normal (user stopped / sought); anything else gets
+        // logged but doesn't break the queue.
+        if (!/cancelled/i.test(String(e && e.message))) {
+          console.warn("[RU-YT] speakRussian failed:", e);
+        }
+      }
+      speaking = false;
+      ctx.speakingUtterance = null;
+      // Drain anything queued while we were speaking.
+      playNextInQueue();
+    };
+
+    const enqueueTranslated = async (text) => {
+      let ru;
+      try {
+        ru = await sendTranslate(text);
       } catch (e) {
         console.warn("[RU-YT] live translate failed:", e);
+        return;
       }
-      busy = false;
-      if (ctx.state === STATE_ACTIVE && pending && pending !== lastText) {
-        const next = pending; pending = null; lastText = next;
-        handleCaption(next);
+      if (ctx.state !== STATE_ACTIVE) return;
+      if (!ru || !ru.trim()) return;
+      ttsQueue.push(ru.trim());
+      playNextInQueue();
+    };
+
+    const commitCaption = (text) => {
+      if (!text || text === lastCommitted) return;
+      // If lastCommitted is a strict prefix of text → enqueue only the new
+      // tail (saves a duplicate of what we just said).
+      let toTranslate = text;
+      if (lastCommitted && text.startsWith(lastCommitted + " ")) {
+        toTranslate = text.slice(lastCommitted.length).trim();
+      } else if (lastCommitted && lastCommitted.startsWith(text)) {
+        // YouTube sometimes briefly shows a *prefix* of an earlier caption
+        // (e.g. when seeking by a few frames). Don't repeat ourselves.
+        return;
       }
+      lastCommitted = text;
+      if (!toTranslate) return;
+      enqueueTranslated(toTranslate);
     };
 
     const scan = () => {
@@ -712,9 +898,15 @@
         .join(" ")
         .replace(/\s+/g, " ")
         .trim();
-      if (!text || text === lastText) return;
-      lastText = text;
-      handleCaption(text);
+      if (!text || text === pendingText) return;
+      pendingText = text;
+      // Debounce: wait until the caption has been stable for a while before
+      // committing. Each new mutation pushes the deadline forward.
+      if (stableTimer) clearTimeout(stableTimer);
+      stableTimer = setTimeout(() => {
+        stableTimer = null;
+        commitCaption(pendingText);
+      }, CAPTION_STABLE_MS);
     };
 
     // Scope the observer to the caption container when present — observing
@@ -729,18 +921,24 @@
       childList: true, subtree: true, characterData: true,
     });
     ctx._liveObserver = observer;
+    ctx._liveStableTimerCancel = () => {
+      if (stableTimer) { clearTimeout(stableTimer); stableTimer = null; }
+    };
+    ctx._liveQueueClear = () => {
+      ttsQueue.length = 0;
+      pendingText = "";
+      lastCommitted = "";
+      speaking = false;
+    };
 
     // Mirror startPlayback() so TTS follows pause / play / seek of the video.
-    const pauseHandler = () => {
-      try { window.speechSynthesis.pause(); } catch {}
-    };
-    const playHandler = () => {
-      try { window.speechSynthesis.resume(); } catch {}
-    };
+    const pauseHandler = () => pauseTts();
+    const playHandler = () => resumeTts();
     const seekHandler = () => {
-      try { window.speechSynthesis.cancel(); } catch {}
-      lastText = "";
-      pending = null;
+      // Seek invalidates everything we have queued — drop it.
+      cancelTts();
+      ctx._liveStableTimerCancel?.();
+      ctx._liveQueueClear?.();
     };
     video.addEventListener("pause", pauseHandler);
     video.addEventListener("play", playHandler);
