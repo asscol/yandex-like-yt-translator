@@ -124,16 +124,20 @@ class JobStore:
                     job.extra[k] = v
             # recompute overall progress across all preceding stages plus the
             # current stage's fractional progress.
-            prior = 0.0
-            for s, w in STAGE_WEIGHTS.items():
-                if s == job.stage:
-                    job.overall = min(1.0, prior + w * job.progress)
-                    break
-                prior += w
-            else:
-                job.overall = 1.0 if job.stage == JobStage.done else prior
-            if job.stage == JobStage.done:
+            if job.stage == JobStage.error:
+                # Keep whatever overall progress was recorded before the error;
+                # otherwise the error stage (positioned last in STAGE_WEIGHTS)
+                # would inherit the sum of all prior weights = 1.0.
+                pass
+            elif job.stage == JobStage.done:
                 job.overall = 1.0
+            else:
+                prior = 0.0
+                for s, w in STAGE_WEIGHTS.items():
+                    if s == job.stage:
+                        job.overall = min(1.0, prior + w * job.progress)
+                        break
+                    prior += w
             job.touch()
             return job
 

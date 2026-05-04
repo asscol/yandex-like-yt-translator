@@ -17,9 +17,13 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
 WORKDIR /build
 COPY pyproject.toml ./
 
-RUN uv venv /opt/venv --python 3.11 \
-    && . /opt/venv/bin/activate \
-    && uv pip install --no-cache --system -r pyproject.toml
+# Install all deps into /opt/venv (stage 2 copies just this venv).
+# `--system` would target the global site-packages and leave the venv
+# empty — runtime would then crash with ModuleNotFoundError.
+RUN uv venv /opt/venv --python 3.11
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:${PATH}"
+RUN uv pip install --no-cache -r pyproject.toml
 
 # Stage 2: slim runtime image.
 FROM python:3.11-slim-bookworm

@@ -25,9 +25,23 @@
     autoMuteOriginal: true,
     sourceLang: "auto", // "auto" | "en"
     targetLang: "ru",
-    ttsEngine: "browser", // "browser" | "backend"
+    // "browser" → Web Speech API (low quality, depends on OS voices)
+    // "piper"   → Piper neural TTS via offscreen doc (4 RU voices)
+    // "backend" → custom FastAPI backend (Whisper + XTTS-v2 voice cloning)
+    ttsEngine: "browser",
+    piperVoice: "ru_RU-ruslan-medium",
     backendUrl: "",
   };
+
+  // Available Piper voices that ship in vendor/ — keep in sync with popup.js.
+  const PIPER_VOICES = [
+    { id: "ru_RU-ruslan-medium", label: "Ruslan (мужской, бас)" },
+    { id: "ru_RU-irina-medium", label: "Irina (женский)" },
+    { id: "ru_RU-denis-medium", label: "Denis (мужской)" },
+    { id: "ru_RU-dmitri-medium", label: "Dmitri (мужской, тенор)" },
+  ];
+  /* exposed for popup.js consumers via window.RU_YT_PIPER_VOICES */
+  try { window.RU_YT_PIPER_VOICES = PIPER_VOICES; } catch {}
 
   /** @type {{
    *   button: HTMLButtonElement|null,
@@ -511,6 +525,171 @@
   // Speech / playback
   // ------------------------------------------------------------------
 
+  // ------------------------------------------------------------------
+  // Piper (offscreen-doc) bridge
+  // ------------------------------------------------------------------
+  // Engine-agnostic primitive: speakRussian(text, opts) → Promise<void>
+  // resolves when the phrase has been fully spoken (or errored).  Both the
+  // segment-based and live-caption queues use this so they can chain
+  // utterances on `await` without any cancel-mid-word logic.
+
+  let piperPreloadPromise = null;
+  let piperPreloadVoice = null;
+  let piperPreloadShownProgress = 0;
+  let piperSpeakSeq = 0;
+
+  function piperEnabled() {
+    return settings.ttsEngine === "piper";
+  }
+
+  function ensurePiperVoice() {
+    // Re-preload if the user changed the voice.
+    if (piperPreloadVoice !== settings.piperVoice) {
+      piperPreloadPromise = null;
+      piperPreloadVoice = settings.piperVoice;
+      piperPreloadShownProgress = 0;
+    }
+    if (piperPreloadPromise) return piperPreloadPromise;
+    piperPreloadPromise = new Promise((resolve, reject) => {
+      if (!isExtensionContextValid()) {
+        return reject(new Error("extension context invalidated"));
+      }
+      chrome.runtime.sendMessage(
+        {
+          type: "ru-yt-piper",
+          payload: { type: "preload", voiceId: settings.piperVoice },
+        },
+        (resp) => {
+          if (chrome.runtime.lastError) {
+            return reject(new Error(chrome.runtime.lastError.message));
+          }
+          if (!resp || !resp.ok) {
+            return reject(new Error((resp && resp.error) || "preload failed"));
+          }
+          resolve();
+        },
+      );
+    }).catch((e) => {
+      piperPreloadPromise = null;  // allow retry on next call
+      throw e;
+    });
+    return piperPreloadPromise;
+  }
+
+  // Surface the offscreen doc's voice-download progress as toasts.
+  try {
+    chrome.runtime.onMessage.addListener((msg) => {
+      if (!msg || msg.target !== "ru-yt-content") return false;
+      if (msg.type === "piper-progress") {
+        const pct = msg.total > 0 ? Math.floor((msg.loaded / msg.total) * 100) : 0;
+        if (pct === 100 || pct - piperPreloadShownProgress >= 10) {
+          piperPreloadShownProgress = pct;
+          showToast(`Загрузка голоса Piper: ${pct}%`, 1500);
+        }
+      }
+      return false;
+    });
+  } catch {}
+
+  function speakRussianViaPiper(text, opts) {
+    return new Promise((resolve, reject) => {
+      if (!isExtensionContextValid()) {
+        return reject(new Error("extension context invalidated"));
+      }
+      const id = ++piperSpeakSeq;
+      chrome.runtime.sendMessage(
+        {
+          type: "ru-yt-piper",
+          payload: {
+            type: "speak",
+            id,
+            text,
+            voiceId: settings.piperVoice,
+            rate: opts && typeof opts.rate === "number" ? opts.rate : settings.rate,
+            volume: opts && typeof opts.volume === "number" ? opts.volume : settings.volume,
+          },
+        },
+        (resp) => {
+          if (chrome.runtime.lastError) {
+            return reject(new Error(chrome.runtime.lastError.message));
+          }
+          if (!resp || !resp.ok) {
+            return reject(new Error((resp && resp.error) || "piper speak failed"));
+          }
+          resolve();
+        },
+      );
+    });
+  }
+
+  function speakRussianViaBrowser(text, opts) {
+    return new Promise((resolve) => {
+      const utt = new SpeechSynthesisUtterance(text);
+      const voice = pickRussianVoice();
+      if (voice) { utt.voice = voice; utt.lang = voice.lang; }
+      else utt.lang = "ru-RU";
+      utt.volume = clamp((opts && opts.volume) ?? settings.volume, 0, 1);
+      utt.pitch = clamp((opts && opts.pitch) ?? settings.pitch, 0.5, 2);
+      utt.rate = clamp((opts && opts.rate) ?? settings.rate, 0.5, 2.0);
+      const finish = () => resolve();
+      utt.onend = finish;
+      utt.onerror = finish;
+      ctx.speakingUtterance = utt;
+      try { window.speechSynthesis.speak(utt); }
+      catch (e) { console.warn("[RU-YT] speak failed:", e); finish(); }
+    });
+  }
+
+  async function speakRussian(text, opts) {
+    if (!text) return;
+    if (piperEnabled()) {
+      try {
+        await ensurePiperVoice();
+        return await speakRussianViaPiper(text, opts);
+      } catch (e) {
+        console.warn("[RU-YT] piper failed, falling back to browser TTS:", e);
+        showToast("Piper недоступен, использую системный голос", 2500);
+      }
+    }
+    return speakRussianViaBrowser(text, opts);
+  }
+
+  function cancelTts() {
+    try { window.speechSynthesis.cancel(); } catch {}
+    if (piperEnabled() && isExtensionContextValid()) {
+      try {
+        chrome.runtime.sendMessage(
+          { type: "ru-yt-piper", payload: { type: "cancel" } },
+          () => void chrome.runtime.lastError,
+        );
+      } catch {}
+    }
+  }
+
+  function pauseTts() {
+    try { window.speechSynthesis.pause(); } catch {}
+    if (piperEnabled() && isExtensionContextValid()) {
+      try {
+        chrome.runtime.sendMessage(
+          { type: "ru-yt-piper", payload: { type: "pause" } },
+          () => void chrome.runtime.lastError,
+        );
+      } catch {}
+    }
+  }
+
+  function resumeTts() {
+    try { window.speechSynthesis.resume(); } catch {}
+    if (piperEnabled() && isExtensionContextValid()) {
+      try {
+        chrome.runtime.sendMessage(
+          { type: "ru-yt-piper", payload: { type: "resume" } },
+          () => void chrome.runtime.lastError,
+        );
+      } catch {}
+    }
+  }
+
   function pickRussianVoice() {
     const voices = window.speechSynthesis.getVoices();
     if (settings.voiceURI) {
@@ -536,22 +715,9 @@
     return null;
   }
 
-  function speakSegment(seg, video) {
+  function speakSegment(seg, _video) {
     if (!seg || !seg.ru) return;
-    try {
-      window.speechSynthesis.cancel();
-    } catch {}
-
-    const utt = new SpeechSynthesisUtterance(seg.ru);
-    const voice = pickRussianVoice();
-    if (voice) {
-      utt.voice = voice;
-      utt.lang = voice.lang;
-    } else {
-      utt.lang = "ru-RU";
-    }
-    utt.volume = clamp(settings.volume, 0, 1);
-    utt.pitch = clamp(settings.pitch, 0.5, 2);
+    cancelTts();
 
     // Auto-adapt rate so a long Russian phrase still fits inside the segment
     // duration. Russian translation is typically ~1.2x longer than English.
@@ -560,17 +726,13 @@
     let rate = baseRate;
     if (charsPerSec > 16) rate = Math.min(2.0, baseRate * 1.25);
     if (charsPerSec > 22) rate = Math.min(2.0, baseRate * 1.5);
-    utt.rate = rate;
 
-    ctx.speakingUtterance = utt;
-    utt.onend = () => {
-      if (ctx.speakingUtterance === utt) ctx.speakingUtterance = null;
-    };
-    utt.onerror = () => {
-      if (ctx.speakingUtterance === utt) ctx.speakingUtterance = null;
-    };
-
-    window.speechSynthesis.speak(utt);
+    // Fire-and-forget: speakRussian routes to Piper or Web Speech depending
+    // on settings.ttsEngine; we don't await because the next timeupdate may
+    // call us with a fresh segment.
+    speakRussian(seg.ru, { rate }).catch((e) => {
+      console.warn("[RU-YT] speakSegment failed:", e);
+    });
   }
 
   function clamp(v, lo, hi) {
@@ -613,20 +775,10 @@
         speakSegment(ctx.segments[idx], video);
       }
     };
-    const pauseHandler = () => {
-      try {
-        window.speechSynthesis.pause();
-      } catch {}
-    };
-    const playHandler = () => {
-      try {
-        window.speechSynthesis.resume();
-      } catch {}
-    };
+    const pauseHandler = () => pauseTts();
+    const playHandler = () => resumeTts();
     const seekHandler = () => {
-      try {
-        window.speechSynthesis.cancel();
-      } catch {}
+      cancelTts();
       ctx.activeIndex = -1;
     };
 
@@ -644,9 +796,7 @@
   }
 
   function stopPlayback() {
-    try {
-      window.speechSynthesis.cancel();
-    } catch {}
+    cancelTts();
     const video = getVideoElement();
     if (video && ctx.timeupdateHandler) {
       video.removeEventListener("timeupdate", ctx.timeupdateHandler);
@@ -723,38 +873,31 @@
     let stableTimer = null;
     let translating = false;
     let pendingNext = null;      // queued text waiting for translator
-    /** @type {Array<{ru:string,utt?:SpeechSynthesisUtterance|null}>} */
+    /** @type {Array<string>} */
     const speakQueue = [];
     let speaking = false;
 
-    const drainSpeakQueue = () => {
+    const drainSpeakQueue = async () => {
       if (speaking) return;
       if (ctx.state !== STATE_ACTIVE) { speakQueue.length = 0; return; }
-      const next = speakQueue.shift();
-      if (!next) return;
-      const utt = new SpeechSynthesisUtterance(next.ru);
-      const voice = pickRussianVoice();
-      if (voice) { utt.voice = voice; utt.lang = voice.lang; }
-      else utt.lang = "ru-RU";
-      utt.volume = clamp(settings.volume, 0, 1);
-      utt.pitch = clamp(settings.pitch, 0.5, 2);
-      utt.rate = clamp(settings.rate, 0.5, 2.0);
+      const ru = speakQueue.shift();
+      if (!ru) return;
       speaking = true;
-      ctx.speakingUtterance = utt;
-      const finish = () => {
-        speaking = false;
-        if (ctx.speakingUtterance === utt) ctx.speakingUtterance = null;
-        drainSpeakQueue();
-      };
-      utt.onend = finish;
-      utt.onerror = finish;
-      try { window.speechSynthesis.speak(utt); }
-      catch { finish(); }
+      try {
+        // speakRussian dispatches to Piper or Web Speech depending on
+        // settings.ttsEngine and resolves only when playback ends — so
+        // the queue naturally plays each phrase to completion.
+        await speakRussian(ru, {});
+      } catch (e) {
+        console.warn("[RU-YT] live speak failed:", e);
+      }
+      speaking = false;
+      drainSpeakQueue();
     };
 
     const enqueueRu = (ru) => {
       if (!ru || ctx.state !== STATE_ACTIVE) return;
-      speakQueue.push({ ru });
+      speakQueue.push(ru);
       drainSpeakQueue();
     };
 
@@ -825,17 +968,14 @@
     });
     ctx._liveObserver = observer;
 
-    // Pause / resume follow the video, but **never** cancel — the user
-    // explicitly asked to keep talking to completion even if we lag.
-    const pauseHandler = () => {
-      try { window.speechSynthesis.pause(); } catch {}
-    };
-    const playHandler = () => {
-      try { window.speechSynthesis.resume(); } catch {}
-    };
+    // Pause / resume follow the video, but **never** cancel during normal
+    // caption flow — the user explicitly asked to keep talking to completion
+    // even if we lag behind subtitles.
+    const pauseHandler = () => pauseTts();
+    const playHandler = () => resumeTts();
     const seekHandler = () => {
       // Seeks DO reset state — the new playhead position is a fresh phrase.
-      try { window.speechSynthesis.cancel(); } catch {}
+      cancelTts();
       speakQueue.length = 0;
       speaking = false;
       domText = "";
