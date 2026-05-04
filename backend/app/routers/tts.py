@@ -61,6 +61,8 @@ async def synthesize_clone(
         )
     except Exception as e:  # pragma: no cover
         raise HTTPException(500, f"TTS clone failed: {e}") from e
+    finally:
+        Path(ref_path).unlink(missing_ok=True)
 
     import soundfile as sf
 

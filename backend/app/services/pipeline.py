@@ -16,6 +16,7 @@ job) and aborts cleanly if the JobStore reports the job was cancelled.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from pathlib import Path
@@ -72,9 +73,12 @@ async def run(job_id: str, video_url: str, target_lang: str = "ru") -> None:
         wav_in = await ytdlp.download_audio(video_url, work_dir)
         await store.update(job_id, stage=JobStage.downloading, progress=1.0)
 
-        # 2. Transcribe
+        # 2. Transcribe — runs on a worker thread so we don't block the
+        # event loop (health checks, progress polling stay responsive).
         await store.update(job_id, stage=JobStage.transcribing, progress=0.1)
-        segments, _detected = whisper.transcribe_file(wav_in, language="en")
+        segments, _detected = await asyncio.to_thread(
+            whisper.transcribe_file, wav_in, language="en"
+        )
         if not segments:
             raise RuntimeError("Whisper returned no segments — the video may be silent.")
         await store.update(job_id, stage=JobStage.transcribing, progress=1.0)
@@ -117,7 +121,8 @@ async def run(job_id: str, video_url: str, target_lang: str = "ru") -> None:
             )
             if not ru.strip():
                 continue
-            samples, sr = xtts.synthesize_to_array(
+            samples, sr = await asyncio.to_thread(
+                xtts.synthesize_to_array,
                 ru,
                 language=target_lang,
                 speaker_wav=ref_clip,

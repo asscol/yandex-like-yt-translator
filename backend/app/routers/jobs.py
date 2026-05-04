@@ -84,6 +84,7 @@ async def delete_job(job_id: str):
             work_dir.rmdir()
         except OSError:
             pass
+    await store.remove(job_id)
     return {"ok": True}
 
 

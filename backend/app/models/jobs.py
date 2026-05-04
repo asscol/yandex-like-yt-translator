@@ -91,6 +91,10 @@ class JobStore:
     async def get(self, jid: str) -> Job | None:
         return self._jobs.get(jid)
 
+    async def remove(self, jid: str) -> bool:
+        async with self._lock:
+            return self._jobs.pop(jid, None) is not None
+
     async def update(
         self,
         jid: str,

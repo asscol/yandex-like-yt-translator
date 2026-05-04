@@ -30,6 +30,8 @@ async def transcribe(file: UploadFile, language: str | None = "en"):
         segments, detected = whisper_svc.transcribe_file(path, language=language)
     except Exception as e:  # pragma: no cover
         raise HTTPException(500, f"Whisper failed: {e}") from e
+    finally:
+        path.unlink(missing_ok=True)
 
     return {
         "language": detected,
