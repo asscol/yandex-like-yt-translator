@@ -6,6 +6,18 @@ const DEFAULTS = {
   volume: 1.0,
   voiceURI: "",
   autoMuteOriginal: true,
+  ttsEngine: "browser", // "browser" | "piper" | "backend"
+  piperVoice: "ru_RU-ruslan-medium",
+  backendUrl: "",
+};
+
+const ENGINE_HINTS = {
+  browser:
+    "Системный TTS (Web Speech API). Быстро, но качество зависит от ОС/браузера.",
+  piper:
+    "Piper — нейронный TTS, работает офлайн. Голос (~60 МБ) скачивается один раз.",
+  backend:
+    "Бэкенд клонирует голос оригинального спикера через XTTS-v2. На CPU 2-минутный ролик обрабатывается ~10–15 мин. См. backend/README.md.",
 };
 
 const els = {
@@ -19,6 +31,13 @@ const els = {
   autoMute: document.getElementById("auto-mute"),
   save: document.getElementById("save"),
   testVoice: document.getElementById("test-voice"),
+  engineRadios: document.querySelectorAll('input[name="tts-engine"]'),
+  engineHint: document.getElementById("engine-hint"),
+  piperSection: document.getElementById("piper-section"),
+  piperVoice: document.getElementById("piper-voice"),
+  backendSection: document.getElementById("backend-section"),
+  backendUrl: document.getElementById("backend-url"),
+  backendStatus: document.getElementById("backend-status"),
 };
 
 function fmtPct(v) {
@@ -87,12 +106,22 @@ function bindRangeDisplay() {
 }
 
 function readForm() {
+  let engine = "browser";
+  for (const r of els.engineRadios) {
+    if (r.checked) {
+      engine = r.value;
+      break;
+    }
+  }
   return {
     rate: parseFloat(els.rate.value),
     pitch: parseFloat(els.pitch.value),
     volume: parseFloat(els.volume.value),
     voiceURI: els.voice.value || "",
     autoMuteOriginal: els.autoMute.checked,
+    ttsEngine: engine,
+    piperVoice: els.piperVoice.value || "ru_RU-ruslan-medium",
+    backendUrl: (els.backendUrl.value || "").trim(),
   };
 }
 
@@ -104,6 +133,41 @@ function writeForm(s) {
   els.volume.value = s.volume;
   els.volumeValue.textContent = fmtPct(s.volume);
   els.autoMute.checked = !!s.autoMuteOriginal;
+  for (const r of els.engineRadios) {
+    r.checked = r.value === (s.ttsEngine || "browser");
+  }
+  els.backendUrl.value = s.backendUrl || "";
+  els.piperVoice.value = s.piperVoice || "ru_RU-ruslan-medium";
+  applyEngineVisibility(s.ttsEngine || "browser");
+}
+
+function applyEngineVisibility(engine) {
+  els.piperSection.hidden = engine !== "piper";
+  els.backendSection.hidden = engine !== "backend";
+  els.engineHint.textContent = ENGINE_HINTS[engine] || "";
+}
+
+async function pingBackend(url) {
+  if (!url) {
+    els.backendStatus.textContent = "";
+    return;
+  }
+  els.backendStatus.textContent = "Проверка соединения…";
+  try {
+    const resp = await fetch(url.replace(/\/+$/, "") + "/healthz", {
+      method: "GET",
+      mode: "cors",
+      cache: "no-store",
+    });
+    if (!resp.ok) {
+      els.backendStatus.textContent = `Бэкенд ответил ${resp.status}`;
+      return;
+    }
+    const data = await resp.json().catch(() => ({}));
+    els.backendStatus.textContent = `OK (версия ${data.version || "?"})`;
+  } catch (e) {
+    els.backendStatus.textContent = `Не удалось подключиться: ${e.message || e}`;
+  }
 }
 
 async function init() {
@@ -114,6 +178,22 @@ async function init() {
   writeForm(stored);
   const voices = await loadVoices();
   populateVoices(voices, stored.voiceURI);
+
+  for (const r of els.engineRadios) {
+    r.addEventListener("change", () => {
+      const eng = readForm().ttsEngine;
+      applyEngineVisibility(eng);
+      if (eng === "backend") {
+        pingBackend(els.backendUrl.value.trim()).catch(() => {});
+      }
+    });
+  }
+  els.backendUrl.addEventListener("blur", () => {
+    pingBackend(els.backendUrl.value.trim()).catch(() => {});
+  });
+  if (stored.ttsEngine === "backend" && stored.backendUrl) {
+    pingBackend(stored.backendUrl).catch(() => {});
+  }
 
   els.save.addEventListener("click", async () => {
     const settings = readForm();
@@ -130,14 +210,39 @@ async function init() {
     flashSaved();
   });
 
-  els.testVoice.addEventListener("click", () => {
-    try {
-      window.speechSynthesis.cancel();
-    } catch {}
-    const utt = new SpeechSynthesisUtterance(
-      "Проверка голоса. Это пример того, как будет звучать перевод видео.",
-    );
+  els.testVoice.addEventListener("click", async () => {
     const settings = readForm();
+    const sample = "Проверка голоса. Это пример того, как будет звучать перевод видео.";
+    if (settings.ttsEngine === "piper") {
+      els.testVoice.disabled = true;
+      const old = els.testVoice.textContent;
+      els.testVoice.textContent = "Готовлю…";
+      try {
+        await chrome.runtime.sendMessage({
+          type: "ru-yt-piper",
+          payload: { type: "preload", voiceId: settings.piperVoice },
+        });
+        await chrome.runtime.sendMessage({
+          type: "ru-yt-piper",
+          payload: {
+            type: "speak",
+            id: Date.now(),
+            text: sample,
+            voiceId: settings.piperVoice,
+            rate: settings.rate,
+            volume: settings.volume,
+          },
+        });
+      } catch (e) {
+        console.warn("piper test failed:", e);
+      } finally {
+        els.testVoice.textContent = old;
+        els.testVoice.disabled = false;
+      }
+      return;
+    }
+    try { window.speechSynthesis.cancel(); } catch {}
+    const utt = new SpeechSynthesisUtterance(sample);
     if (settings.voiceURI) {
       const v = window.speechSynthesis.getVoices().find((x) => x.voiceURI === settings.voiceURI);
       if (v) {

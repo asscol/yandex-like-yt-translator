@@ -2,14 +2,19 @@
   "manifest_version": 3,
   "name": "YouTube Russian Voice Translator",
   "short_name": "RU YT Translator",
-  "version": "0.1.0",
-  "description": "Переводит YouTube-видео на русский язык голосом (как в Яндекс.Браузере). MVP: субтитры + Web Speech TTS.",
+  "version": "0.2.0",
+  "description": "Переводит YouTube-видео на русский язык голосом. Три движка: Браузер (Web Speech), Piper (4 нейро-голоса) и Бэкенд (XTTS-v2 «живые голоса»).",
   "default_locale": "ru",
-  "permissions": ["storage"],
+  "permissions": ["storage", "offscreen", "scripting"],
   "host_permissions": [
     "*://*.youtube.com/*",
     "*://www.youtube.com/*",
-    "*://translate.googleapis.com/*"
+    "*://translate.googleapis.com/*",
+    "*://huggingface.co/*",
+    "*://*.huggingface.co/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*",
+    "https://*.fly.dev/*"
   ],
   "action": {
     "default_popup": "popup.html",
@@ -38,5 +43,15 @@
   "background": {
     "service_worker": "background.js",
     "type": "module"
-  }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "vendor/vits-web/*",
+        "vendor/onnxruntime-web/*",
+        "vendor/piper-wasm/*"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ]
 }

@@ -13,6 +13,50 @@
 
     <main>
       <section>
+        <label>Движок голоса</label>
+        <div class="engine-toggle">
+          <label class="inline">
+            <input type="radio" name="tts-engine" value="browser" />
+            <span>Браузер (быстро, системный голос)</span>
+          </label>
+          <label class="inline">
+            <input type="radio" name="tts-engine" value="piper" />
+            <span>Piper (нейро-голоса, офлайн)</span>
+          </label>
+          <label class="inline">
+            <input type="radio" name="tts-engine" value="backend" />
+            <span>Бэкенд (живые голоса, клонирование тембра)</span>
+          </label>
+        </div>
+        <p class="muted" id="engine-hint"></p>
+      </section>
+
+      <section id="piper-section" hidden>
+        <label for="piper-voice">Голос Piper</label>
+        <select id="piper-voice">
+          <option value="ru_RU-ruslan-medium">Ruslan — мужской, бас</option>
+          <option value="ru_RU-irina-medium">Irina — женский</option>
+          <option value="ru_RU-denis-medium">Denis — мужской</option>
+          <option value="ru_RU-dmitri-medium">Dmitri — мужской, тенор</option>
+        </select>
+        <p class="muted">
+          Каждый голос — отдельный файл ~60 МБ. Скачивается с HuggingFace
+          при первом включении и кешируется офлайн.
+        </p>
+      </section>
+
+      <section id="backend-section" hidden>
+        <label for="backend-url">URL бэкенда</label>
+        <input
+          type="url"
+          id="backend-url"
+          placeholder="https://ru-yt-translator.fly.dev"
+          autocomplete="off"
+        />
+        <p class="muted" id="backend-status"></p>
+      </section>
+
+      <section>
         <label for="voice">Русский голос</label>
         <select id="voice"></select>
         <button id="test-voice" type="button" class="secondary">Проверить голос</button>

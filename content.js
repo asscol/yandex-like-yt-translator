@@ -25,7 +25,23 @@
     autoMuteOriginal: true,
     sourceLang: "auto", // "auto" | "en"
     targetLang: "ru",
+    // "browser" → Web Speech API (low quality, depends on OS voices)
+    // "piper"   → Piper neural TTS via offscreen doc (4 RU voices)
+    // "backend" → custom FastAPI backend (Whisper + XTTS-v2 voice cloning)
+    ttsEngine: "browser",
+    piperVoice: "ru_RU-ruslan-medium",
+    backendUrl: "",
   };
+
+  // Available Piper voices that ship in vendor/ — keep in sync with popup.js.
+  const PIPER_VOICES = [
+    { id: "ru_RU-ruslan-medium", label: "Ruslan (мужской, бас)" },
+    { id: "ru_RU-irina-medium", label: "Irina (женский)" },
+    { id: "ru_RU-denis-medium", label: "Denis (мужской)" },
+    { id: "ru_RU-dmitri-medium", label: "Dmitri (мужской, тенор)" },
+  ];
+  /* exposed for popup.js consumers via window.RU_YT_PIPER_VOICES */
+  try { window.RU_YT_PIPER_VOICES = PIPER_VOICES; } catch {}
 
   /** @type {{
    *   button: HTMLButtonElement|null,
@@ -37,6 +53,10 @@
    *   timeupdateHandler: ((e:Event)=>void)|null,
    *   navHandler: (()=>void)|null,
    *   speakingUtterance: SpeechSynthesisUtterance|null,
+   *   backendAudio: HTMLAudioElement|null,
+   *   backendSyncCleanup: (()=>void)|null,
+   *   backendJobId: string|null,
+   *   backendCancel: AbortController|null,
    * }} */
   const ctx = {
     button: null,
@@ -48,6 +68,10 @@
     timeupdateHandler: null,
     navHandler: null,
     speakingUtterance: null,
+    backendAudio: null,
+    backendSyncCleanup: null,
+    backendJobId: null,
+    backendCancel: null,
   };
 
   let settings = { ...DEFAULT_SETTINGS };
@@ -501,6 +525,171 @@
   // Speech / playback
   // ------------------------------------------------------------------
 
+  // ------------------------------------------------------------------
+  // Piper (offscreen-doc) bridge
+  // ------------------------------------------------------------------
+  // Engine-agnostic primitive: speakRussian(text, opts) → Promise<void>
+  // resolves when the phrase has been fully spoken (or errored).  Both the
+  // segment-based and live-caption queues use this so they can chain
+  // utterances on `await` without any cancel-mid-word logic.
+
+  let piperPreloadPromise = null;
+  let piperPreloadVoice = null;
+  let piperPreloadShownProgress = 0;
+  let piperSpeakSeq = 0;
+
+  function piperEnabled() {
+    return settings.ttsEngine === "piper";
+  }
+
+  function ensurePiperVoice() {
+    // Re-preload if the user changed the voice.
+    if (piperPreloadVoice !== settings.piperVoice) {
+      piperPreloadPromise = null;
+      piperPreloadVoice = settings.piperVoice;
+      piperPreloadShownProgress = 0;
+    }
+    if (piperPreloadPromise) return piperPreloadPromise;
+    piperPreloadPromise = new Promise((resolve, reject) => {
+      if (!isExtensionContextValid()) {
+        return reject(new Error("extension context invalidated"));
+      }
+      chrome.runtime.sendMessage(
+        {
+          type: "ru-yt-piper",
+          payload: { type: "preload", voiceId: settings.piperVoice },
+        },
+        (resp) => {
+          if (chrome.runtime.lastError) {
+            return reject(new Error(chrome.runtime.lastError.message));
+          }
+          if (!resp || !resp.ok) {
+            return reject(new Error((resp && resp.error) || "preload failed"));
+          }
+          resolve();
+        },
+      );
+    }).catch((e) => {
+      piperPreloadPromise = null;  // allow retry on next call
+      throw e;
+    });
+    return piperPreloadPromise;
+  }
+
+  // Surface the offscreen doc's voice-download progress as toasts.
+  try {
+    chrome.runtime.onMessage.addListener((msg) => {
+      if (!msg || msg.target !== "ru-yt-content") return false;
+      if (msg.type === "piper-progress") {
+        const pct = msg.total > 0 ? Math.floor((msg.loaded / msg.total) * 100) : 0;
+        if (pct === 100 || pct - piperPreloadShownProgress >= 10) {
+          piperPreloadShownProgress = pct;
+          showToast(`Загрузка голоса Piper: ${pct}%`, 1500);
+        }
+      }
+      return false;
+    });
+  } catch {}
+
+  function speakRussianViaPiper(text, opts) {
+    return new Promise((resolve, reject) => {
+      if (!isExtensionContextValid()) {
+        return reject(new Error("extension context invalidated"));
+      }
+      const id = ++piperSpeakSeq;
+      chrome.runtime.sendMessage(
+        {
+          type: "ru-yt-piper",
+          payload: {
+            type: "speak",
+            id,
+            text,
+            voiceId: settings.piperVoice,
+            rate: opts && typeof opts.rate === "number" ? opts.rate : settings.rate,
+            volume: opts && typeof opts.volume === "number" ? opts.volume : settings.volume,
+          },
+        },
+        (resp) => {
+          if (chrome.runtime.lastError) {
+            return reject(new Error(chrome.runtime.lastError.message));
+          }
+          if (!resp || !resp.ok) {
+            return reject(new Error((resp && resp.error) || "piper speak failed"));
+          }
+          resolve();
+        },
+      );
+    });
+  }
+
+  function speakRussianViaBrowser(text, opts) {
+    return new Promise((resolve) => {
+      const utt = new SpeechSynthesisUtterance(text);
+      const voice = pickRussianVoice();
+      if (voice) { utt.voice = voice; utt.lang = voice.lang; }
+      else utt.lang = "ru-RU";
+      utt.volume = clamp((opts && opts.volume) ?? settings.volume, 0, 1);
+      utt.pitch = clamp((opts && opts.pitch) ?? settings.pitch, 0.5, 2);
+      utt.rate = clamp((opts && opts.rate) ?? settings.rate, 0.5, 2.0);
+      const finish = () => resolve();
+      utt.onend = finish;
+      utt.onerror = finish;
+      ctx.speakingUtterance = utt;
+      try { window.speechSynthesis.speak(utt); }
+      catch (e) { console.warn("[RU-YT] speak failed:", e); finish(); }
+    });
+  }
+
+  async function speakRussian(text, opts) {
+    if (!text) return;
+    if (piperEnabled()) {
+      try {
+        await ensurePiperVoice();
+        return await speakRussianViaPiper(text, opts);
+      } catch (e) {
+        console.warn("[RU-YT] piper failed, falling back to browser TTS:", e);
+        showToast("Piper недоступен, использую системный голос", 2500);
+      }
+    }
+    return speakRussianViaBrowser(text, opts);
+  }
+
+  function cancelTts() {
+    try { window.speechSynthesis.cancel(); } catch {}
+    if (piperEnabled() && isExtensionContextValid()) {
+      try {
+        chrome.runtime.sendMessage(
+          { type: "ru-yt-piper", payload: { type: "cancel" } },
+          () => void chrome.runtime.lastError,
+        );
+      } catch {}
+    }
+  }
+
+  function pauseTts() {
+    try { window.speechSynthesis.pause(); } catch {}
+    if (piperEnabled() && isExtensionContextValid()) {
+      try {
+        chrome.runtime.sendMessage(
+          { type: "ru-yt-piper", payload: { type: "pause" } },
+          () => void chrome.runtime.lastError,
+        );
+      } catch {}
+    }
+  }
+
+  function resumeTts() {
+    try { window.speechSynthesis.resume(); } catch {}
+    if (piperEnabled() && isExtensionContextValid()) {
+      try {
+        chrome.runtime.sendMessage(
+          { type: "ru-yt-piper", payload: { type: "resume" } },
+          () => void chrome.runtime.lastError,
+        );
+      } catch {}
+    }
+  }
+
   function pickRussianVoice() {
     const voices = window.speechSynthesis.getVoices();
     if (settings.voiceURI) {
@@ -526,22 +715,9 @@
     return null;
   }
 
-  function speakSegment(seg, video) {
+  function speakSegment(seg, _video) {
     if (!seg || !seg.ru) return;
-    try {
-      window.speechSynthesis.cancel();
-    } catch {}
-
-    const utt = new SpeechSynthesisUtterance(seg.ru);
-    const voice = pickRussianVoice();
-    if (voice) {
-      utt.voice = voice;
-      utt.lang = voice.lang;
-    } else {
-      utt.lang = "ru-RU";
-    }
-    utt.volume = clamp(settings.volume, 0, 1);
-    utt.pitch = clamp(settings.pitch, 0.5, 2);
+    cancelTts();
 
     // Auto-adapt rate so a long Russian phrase still fits inside the segment
     // duration. Russian translation is typically ~1.2x longer than English.
@@ -550,17 +726,13 @@
     let rate = baseRate;
     if (charsPerSec > 16) rate = Math.min(2.0, baseRate * 1.25);
     if (charsPerSec > 22) rate = Math.min(2.0, baseRate * 1.5);
-    utt.rate = rate;
 
-    ctx.speakingUtterance = utt;
-    utt.onend = () => {
-      if (ctx.speakingUtterance === utt) ctx.speakingUtterance = null;
-    };
-    utt.onerror = () => {
-      if (ctx.speakingUtterance === utt) ctx.speakingUtterance = null;
-    };
-
-    window.speechSynthesis.speak(utt);
+    // Fire-and-forget: speakRussian routes to Piper or Web Speech depending
+    // on settings.ttsEngine; we don't await because the next timeupdate may
+    // call us with a fresh segment.
+    speakRussian(seg.ru, { rate }).catch((e) => {
+      console.warn("[RU-YT] speakSegment failed:", e);
+    });
   }
 
   function clamp(v, lo, hi) {
@@ -603,20 +775,10 @@
         speakSegment(ctx.segments[idx], video);
       }
     };
-    const pauseHandler = () => {
-      try {
-        window.speechSynthesis.pause();
-      } catch {}
-    };
-    const playHandler = () => {
-      try {
-        window.speechSynthesis.resume();
-      } catch {}
-    };
+    const pauseHandler = () => pauseTts();
+    const playHandler = () => resumeTts();
     const seekHandler = () => {
-      try {
-        window.speechSynthesis.cancel();
-      } catch {}
+      cancelTts();
       ctx.activeIndex = -1;
     };
 
@@ -634,9 +796,7 @@
   }
 
   function stopPlayback() {
-    try {
-      window.speechSynthesis.cancel();
-    } catch {}
+    cancelTts();
     const video = getVideoElement();
     if (video && ctx.timeupdateHandler) {
       video.removeEventListener("timeupdate", ctx.timeupdateHandler);
@@ -652,6 +812,27 @@
       try { ctx._liveObserver.disconnect(); } catch {}
       ctx._liveObserver = null;
     }
+    // Backend audio cleanup.
+    if (ctx.backendCancel) {
+      try { ctx.backendCancel.abort(); } catch {}
+      ctx.backendCancel = null;
+    }
+    if (ctx.backendSyncCleanup) {
+      try { ctx.backendSyncCleanup(); } catch {}
+      ctx.backendSyncCleanup = null;
+    }
+    if (ctx.backendAudio) {
+      try {
+        ctx.backendAudio.pause();
+        if (ctx.backendAudio.src && ctx.backendAudio.src.startsWith("blob:")) {
+          URL.revokeObjectURL(ctx.backendAudio.src);
+        }
+        ctx.backendAudio.src = "";
+        ctx.backendAudio.remove();
+      } catch {}
+      ctx.backendAudio = null;
+    }
+    ctx.backendJobId = null;
     if (video && ctx.wasMuted !== null) video.muted = ctx.wasMuted;
     ctx.wasMuted = null;
     ctx.activeIndex = -1;
@@ -673,34 +854,91 @@
     ctx.wasMuted = video.muted;
     if (settings.autoMuteOriginal) video.muted = true;
 
-    let lastText = "";
-    let busy = false;
-    let pending = null;
+    // Sequential play-to-completion queue.
+    // Rationale: YouTube auto-CC reveals each caption frame word-by-word, so
+    // the DOM changes 5–10× per spoken phrase. Cancelling the in-flight
+    // utterance on every change made the voice stutter and restart phrases
+    // ("не договаривает, начинает другое"). Instead we:
+    //   1. Debounce caption text until it's stable for STABLE_MS.
+    //   2. Strip the prefix already spoken (so an extended caption only
+    //      voices its new tail, never repeats the head).
+    //   3. Enqueue the fresh tail and only `speak()` after the previous
+    //      utterance fires `onend` — never `cancel()` mid-speech, even if
+    //      we lag behind the video.
+    const STABLE_MS = 700;       // commit caption after it stops changing
+    const MIN_COMMIT_LEN = 6;    // skip 1–2 letter partials
+    let domText = "";            // freshest text observed in DOM
+    let lastCommitted = "";      // last text committed to translation
+    let lastSpokenPrefix = "";   // longest contiguous text already spoken
+    let stableTimer = null;
+    let translating = false;
+    let pendingNext = null;      // queued text waiting for translator
+    /** @type {Array<string>} */
+    const speakQueue = [];
+    let speaking = false;
 
-    const handleCaption = async (text) => {
-      if (busy) { pending = text; return; }
-      busy = true;
+    const drainSpeakQueue = async () => {
+      if (speaking) return;
+      if (ctx.state !== STATE_ACTIVE) { speakQueue.length = 0; return; }
+      const ru = speakQueue.shift();
+      if (!ru) return;
+      speaking = true;
       try {
-        const ru = await sendTranslate(text);
-        if (ctx.state !== STATE_ACTIVE) { busy = false; return; }
-        try { window.speechSynthesis.cancel(); } catch {}
-        const utt = new SpeechSynthesisUtterance(ru);
-        const voice = pickRussianVoice();
-        if (voice) { utt.voice = voice; utt.lang = voice.lang; }
-        else utt.lang = "ru-RU";
-        utt.volume = clamp(settings.volume, 0, 1);
-        utt.pitch = clamp(settings.pitch, 0.5, 2);
-        utt.rate = clamp(settings.rate, 0.5, 2.0);
-        ctx.speakingUtterance = utt;
-        window.speechSynthesis.speak(utt);
+        // speakRussian dispatches to Piper or Web Speech depending on
+        // settings.ttsEngine and resolves only when playback ends — so
+        // the queue naturally plays each phrase to completion.
+        await speakRussian(ru, {});
+      } catch (e) {
+        console.warn("[RU-YT] live speak failed:", e);
+      }
+      speaking = false;
+      drainSpeakQueue();
+    };
+
+    const enqueueRu = (ru) => {
+      if (!ru || ctx.state !== STATE_ACTIVE) return;
+      speakQueue.push(ru);
+      drainSpeakQueue();
+    };
+
+    const stripSpokenPrefix = (full) => {
+      if (!lastSpokenPrefix) return full;
+      // If the new caption is just a longer version of what we've already
+      // committed (typical extension-as-you-watch behaviour), only translate
+      // & speak the suffix. Otherwise it's a fresh phrase, speak it whole.
+      if (full.startsWith(lastSpokenPrefix)) {
+        return full.slice(lastSpokenPrefix.length).trim();
+      }
+      return full;
+    };
+
+    const commitIfStable = async () => {
+      if (translating) { pendingNext = domText; return; }
+      const candidate = domText;
+      if (!candidate || candidate === lastCommitted) return;
+      const tail = stripSpokenPrefix(candidate);
+      if (!tail || tail.length < MIN_COMMIT_LEN) return;
+      lastCommitted = candidate;
+      lastSpokenPrefix = candidate;
+      translating = true;
+      try {
+        const ru = await sendTranslate(tail);
+        if (ctx.state === STATE_ACTIVE && ru) enqueueRu(ru.trim());
       } catch (e) {
         console.warn("[RU-YT] live translate failed:", e);
+      } finally {
+        translating = false;
+        if (pendingNext && ctx.state === STATE_ACTIVE) {
+          pendingNext = null;
+          // Re-arm the debounce so we don't immediately re-translate.
+          scheduleCommit();
+        }
       }
-      busy = false;
-      if (ctx.state === STATE_ACTIVE && pending && pending !== lastText) {
-        const next = pending; pending = null; lastText = next;
-        handleCaption(next);
-      }
+    };
+
+    const scheduleCommit = () => {
+      if (stableTimer) clearTimeout(stableTimer);
+      stableTimer = setTimeout(commitIfStable, STABLE_MS);
     };
 
     const scan = () => {
@@ -712,9 +950,9 @@
         .join(" ")
         .replace(/\s+/g, " ")
         .trim();
-      if (!text || text === lastText) return;
-      lastText = text;
-      handleCaption(text);
+      if (!text || text === domText) return;
+      domText = text;
+      scheduleCommit();
     };
 
     // Scope the observer to the caption container when present — observing
@@ -730,17 +968,21 @@
     });
     ctx._liveObserver = observer;
 
-    // Mirror startPlayback() so TTS follows pause / play / seek of the video.
-    const pauseHandler = () => {
-      try { window.speechSynthesis.pause(); } catch {}
-    };
-    const playHandler = () => {
-      try { window.speechSynthesis.resume(); } catch {}
-    };
+    // Pause / resume follow the video, but **never** cancel during normal
+    // caption flow — the user explicitly asked to keep talking to completion
+    // even if we lag behind subtitles.
+    const pauseHandler = () => pauseTts();
+    const playHandler = () => resumeTts();
     const seekHandler = () => {
-      try { window.speechSynthesis.cancel(); } catch {}
-      lastText = "";
-      pending = null;
+      // Seeks DO reset state — the new playhead position is a fresh phrase.
+      cancelTts();
+      speakQueue.length = 0;
+      speaking = false;
+      domText = "";
+      lastCommitted = "";
+      lastSpokenPrefix = "";
+      pendingNext = null;
+      if (stableTimer) { clearTimeout(stableTimer); stableTimer = null; }
     };
     video.addEventListener("pause", pauseHandler);
     video.addEventListener("play", playHandler);
@@ -759,6 +1001,158 @@
   // Click handler
   // ------------------------------------------------------------------
 
+  // ------------------------------------------------------------------
+  // Backend mode ("живые голоса"): full-pipeline translate + voice clone
+  // delegated to a self-hosted FastAPI service (see backend/).
+  //
+  // Flow:
+  //   1. POST /jobs/translate-video {video_url, target_lang}
+  //   2. Poll /jobs/{id} until stage=done (with progress tickers)
+  //   3. Fetch /jobs/{id}/audio as a blob, attach to a hidden <audio>
+  //   4. Mute the original video and play the audio in sync (play/pause/seek
+  //      events on <video> are mirrored to <audio>).
+  // ------------------------------------------------------------------
+
+  function backendBaseUrl() {
+    const raw = (settings.backendUrl || "").trim();
+    if (!raw) return "";
+    return raw.replace(/\/+$/, "");
+  }
+
+  async function backendCreateJob(videoUrl, targetLang, signal) {
+    const base = backendBaseUrl();
+    if (!base) throw new Error("Бэкенд не настроен. Откройте попап и укажите URL.");
+    const resp = await fetch(`${base}/jobs/translate-video`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ video_url: videoUrl, target_lang: targetLang || "ru" }),
+      signal,
+    });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw new Error(`Бэкенд: ${resp.status} ${text.slice(0, 200)}`);
+    }
+    return await resp.json();
+  }
+
+  async function backendPollUntilDone(jobId, signal, onProgress) {
+    const base = backendBaseUrl();
+    let lastStage = "";
+    while (true) {
+      if (signal && signal.aborted) throw new DOMException("aborted", "AbortError");
+      const resp = await fetch(`${base}/jobs/${jobId}`, {
+        method: "GET",
+        cache: "no-store",
+        signal,
+      });
+      if (!resp.ok) throw new Error(`Бэкенд: статус задания ${resp.status}`);
+      const data = await resp.json();
+      if (data.stage !== lastStage) {
+        lastStage = data.stage;
+      }
+      if (typeof onProgress === "function") {
+        onProgress(data);
+      }
+      if (data.stage === "done") return data;
+      if (data.stage === "error") throw new Error(data.error || "Бэкенд вернул ошибку");
+      await new Promise((res) => setTimeout(res, 2000));
+    }
+  }
+
+  async function backendDownloadAudio(jobId, signal) {
+    const base = backendBaseUrl();
+    const resp = await fetch(`${base}/jobs/${jobId}/audio`, { signal });
+    if (!resp.ok) throw new Error(`Бэкенд: не удалось скачать аудио (${resp.status})`);
+    return await resp.blob();
+  }
+
+  function attachBackendAudioToVideo(audio, video) {
+    // Mirror video play/pause/seek/rate onto the audio element.
+    const onPlay = () => audio.play().catch(() => {});
+    const onPause = () => audio.pause();
+    const onSeeking = () => {
+      try { audio.currentTime = video.currentTime; } catch {}
+    };
+    const onRate = () => {
+      try { audio.playbackRate = video.playbackRate; } catch {}
+    };
+    video.addEventListener("play", onPlay);
+    video.addEventListener("pause", onPause);
+    video.addEventListener("seeking", onSeeking);
+    video.addEventListener("ratechange", onRate);
+
+    // Initial sync.
+    try {
+      audio.currentTime = video.currentTime;
+      audio.playbackRate = video.playbackRate;
+    } catch {}
+
+    if (!video.paused) {
+      audio.play().catch(() => {});
+    }
+
+    return () => {
+      video.removeEventListener("play", onPlay);
+      video.removeEventListener("pause", onPause);
+      video.removeEventListener("seeking", onSeeking);
+      video.removeEventListener("ratechange", onRate);
+    };
+  }
+
+  async function startBackendMode() {
+    const video = getVideoElement();
+    if (!video) throw new Error("Видео-элемент не найден");
+    const videoUrl = location.href;
+
+    const ac = new AbortController();
+    ctx.backendCancel = ac;
+
+    showToast("Отправляю видео на бэкенд…", 3500);
+    const created = await backendCreateJob(videoUrl, settings.targetLang || "ru", ac.signal);
+    ctx.backendJobId = created.id;
+
+    showToast(`Бэкенд принял задание (${created.id}). Ждём результат…`, 4000);
+    const stageLabel = {
+      queued: "В очереди",
+      downloading: "Скачивание видео",
+      transcribing: "Распознавание речи",
+      translating: "Перевод текста",
+      extracting_voice: "Извлечение голоса",
+      synthesizing: "Синтез речи",
+    };
+    await backendPollUntilDone(created.id, ac.signal, (data) => {
+      if (ctx.button) {
+        const labelEl = ctx.button.querySelector(".ru-yt-translate-label");
+        if (labelEl) {
+          const pct = Math.round((data.overall || 0) * 100);
+          const stage = stageLabel[data.stage] || data.stage;
+          labelEl.textContent = `${stage}… ${pct}%`;
+        }
+      }
+    });
+
+    showToast("Скачиваю синтезированное аудио…", 2500);
+    const blob = await backendDownloadAudio(created.id, ac.signal);
+    const url = URL.createObjectURL(blob);
+
+    const audio = document.createElement("audio");
+    audio.preload = "auto";
+    audio.src = url;
+    audio.crossOrigin = "anonymous";
+    audio.style.display = "none";
+    document.body.appendChild(audio);
+    ctx.backendAudio = audio;
+
+    if (ctx.wasMuted === null) ctx.wasMuted = video.muted;
+    if (settings.autoMuteOriginal) video.muted = true;
+    audio.volume = clamp(settings.volume, 0, 1);
+
+    ctx.backendSyncCleanup = attachBackendAudioToVideo(audio, video);
+
+    setButtonState(STATE_ACTIVE, "Выключить");
+    showToast("Бэкенд готов. Озвучка играет синхронно с видео.", 4000);
+  }
+
   async function onButtonClick() {
     if (ctx.state === STATE_ACTIVE) {
       stopPlayback();
@@ -769,10 +1163,20 @@
     if (ctx.state === STATE_LOADING) return;
 
     setButtonState(STATE_LOADING, "Готовлю…");
-    showToast("Скачиваю субтитры…");
 
     try {
       await loadSettings();
+
+      // Backend mode (full-pipeline live voices) takes a different path: it
+      // sends the video URL to the FastAPI service which does Whisper +
+      // translate + XTTS-v2 voice cloning, and we play the resulting WAV
+      // synced to the <video> element.
+      if (settings.ttsEngine === "backend") {
+        await startBackendMode();
+        return;
+      }
+
+      showToast("Скачиваю субтитры…");
 
       const videoId = getCurrentVideoId();
       if (!videoId) throw new Error("Это не страница видео.");
